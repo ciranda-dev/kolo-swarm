@@ -10,7 +10,7 @@
 // node's IP address and public key, and an announced topic hash and IP address become visible there. Pass an explicit
 // list to stay private.
 //
-// v0.1.x is IPv4 only, and IPv6 input, IPv4-mapped included, is refused with ErrInvalidArgument.
+// kolo-swarm is IPv4 only, and IPv6 input, IPv4-mapped included, is refused with ErrInvalidArgument.
 //
 // Experimental: the API may change before v1.0.0.
 package koloswarm

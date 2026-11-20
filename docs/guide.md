@@ -496,7 +496,7 @@ and `kolo-node check -relay` checks one from the machine it runs on.
 
 ## Addresses and filtering
 
-v0.1.x is IPv4 only and IPv6 input is refused: an IPv6 address,
+kolo-swarm is IPv4 only and IPv6 input is refused: an IPv6 address,
 IPv4-mapped included, given to `New`, `Bootstrap`, `Attach` or `Connect`
 is `ErrInvalidArgument`, and a lookup record or kolo-dht connection with
 one is dropped before `Allow` sees it.

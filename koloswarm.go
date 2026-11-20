@@ -123,7 +123,7 @@ type Swarm struct {
 }
 
 // New opens a kolo-dht node on addr, such as "127.0.0.1:0" or ":4000", as id, and starts the swarm on it.
-// v0.1.x is IPv4 only: an IPv6 addr, IPv4-mapped included, is ErrInvalidArgument.
+// kolo-swarm is IPv4 only: an IPv6 addr, IPv4-mapped included, is ErrInvalidArgument.
 func New(ctx context.Context, addr string, id *koloid.Identity, cfg *Config) (*Swarm, error) {
 	pub := id.PublicKey()
 	if pub == nil {
@@ -232,7 +232,7 @@ func (s *Swarm) localIP() netip.Addr {
 }
 
 func errIPv6(what string) error {
-	return fmt.Errorf("%w: IPv6 %s, and v0.1.x is IPv4 only", ErrInvalidArgument, what)
+	return fmt.Errorf("%w: IPv6 %s, and kolo-swarm is IPv4 only", ErrInvalidArgument, what)
 }
 
 // Close closes every peer connection and the node, and waits for the swarm's goroutines. It is safe to call more than once.

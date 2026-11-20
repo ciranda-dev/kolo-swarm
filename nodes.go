@@ -143,7 +143,7 @@ func addNode(out []string, e string, where func() string) ([]string, error) {
 	return append(out, n), nil
 }
 
-var errNodeIPv6 = errors.New("an IPv6 address is refused: v0.1.x is IPv4 only")
+var errNodeIPv6 = errors.New("an IPv6 address is refused: kolo-swarm is IPv4 only")
 
 // parseNode returns s as host:port with a canonical IPv4 address or a lowercase DNS name, and a port from 1 to 65535.
 func parseNode(s string) (string, error) {
