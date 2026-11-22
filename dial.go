@@ -28,46 +28,93 @@ func (s *Swarm) dialLoop() {
 	}
 }
 
-// dialTopicLocked returns a joined topic of c with room. Call with mu held.
-func (s *Swarm) dialTopicLocked(c *cand) (Topic, bool) {
+// dialTopicLocked returns the joined topic of c to dial for: one with room and a record not suspect, the one holding
+// the fewest places for its fair share. Call with mu held.
+func (s *Swarm) dialTopicLocked(c *cand, ta tally, j int) (Topic, bool) {
+	var best Topic
+	found := false
 	for x := range c.topics {
-		if t := s.topics[x]; t != nil && !t.joining && s.roomLocked(x, false) {
-			return x, true
+		if t := s.topics[x]; t == nil || t.joining || !s.roomIn(ta, x, false) {
+			continue
+		}
+		if !found || s.dialBefore(c, ta, j, x, best) {
+			best, found = x, true
 		}
 	}
-	return Topic{}, false
+	return best, found
+}
+
+// dialBefore reports whether a dial for topic a is preferred to one for b: a record not suspect first, then the lower
+// share of its fair share held.
+func (s *Swarm) dialBefore(c *cand, ta tally, j int, a, b Topic) bool {
+	if c.suspect[a] != c.suspect[b] {
+		return c.suspect[b]
+	}
+	return int64(ta[a].total)*int64(s.shareOf(s.topics[b], j)) < int64(ta[b].total)*int64(s.shareOf(s.topics[a], j))
+}
+
+// needOf ranks the need of topic x for a dial: 0 below its outbound minimum, 1 below its fair share, else 2.
+func (s *Swarm) needOf(ta tally, x Topic, j int) int {
+	t := s.topics[x]
+	switch n := ta[x]; {
+	case n.out < s.minOutOf(t, j):
+		return 0
+	case n.total < s.shareOf(t, j):
+		return 1
+	}
+	return 2
 }
 
 // dialSome starts the dials that limits and backoff allow and returns how long until the next may start.
 func (s *Swarm) dialSome() time.Duration {
-	now := time.Now()
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	wait, evicted := s.dialRoundLocked(time.Now())
+	s.mu.Unlock()
+	for _, c := range evicted {
+		s.closeAsync(c, codeFull)
+	}
+	return wait
+}
+
+// dialRoundLocked is dialSome under mu; it also returns the connections it evicted, to close after the unlock.
+func (s *Swarm) dialRoundLocked(now time.Time) (time.Duration, []Conn) {
 	wait := time.Minute
 	if s.closed {
-		return wait
+		return wait, nil
 	}
+	ta, j := s.tallyLocked(), s.joinedCountLocked()
+	full := s.placesLocked() >= s.cfg.MaxPeers
 	type choice struct {
-		k key
-		c *cand
+		k    key
+		c    *cand
+		need int
 	}
 	var ready []choice
 	for k, c := range s.cands {
 		if s.slots[k] != nil || s.helloKey[k] > 0 {
 			continue
 		}
-		if _, ok := s.dialTopicLocked(c); !ok {
+		x, ok := s.dialTopicLocked(c, ta, j)
+		if !ok {
 			continue
 		}
 		if now.Before(c.next) {
 			wait = min(wait, c.next.Sub(now))
 			continue
 		}
-		ready = append(ready, choice{k, c})
+		need := s.needOf(ta, x, j)
+		if full && need == 2 {
+			continue
+		}
+		ready = append(ready, choice{k, c, need})
 	}
-	// Keys whose outbound connection lasted first, then fewest failures; a TryLater weighs as a failure here.
+	// Topics below their outbound minimum, then below their fair share, first; then keys whose outbound connection
+	// lasted, then fewest failures; a TryLater weighs as a failure here.
 	rand.Shuffle(len(ready), func(i, j int) { ready[i], ready[j] = ready[j], ready[i] })
 	slices.SortStableFunc(ready, func(a, b choice) int {
+		if a.need != b.need {
+			return a.need - b.need
+		}
 		if a.c.connected != b.c.connected {
 			if a.c.connected {
 				return -1
@@ -91,28 +138,120 @@ func (s *Swarm) dialSome() time.Duration {
 			mark(sl.own, sl.via)
 		}
 	}
+	var evicted []Conn
+	noVictim := map[Topic]bool{}
 	for _, ch := range ready {
-		if s.dialing >= s.cfg.MaxConnecting || s.placesLocked() >= s.cfg.MaxPeers {
+		if s.dialing >= s.cfg.MaxConnecting {
 			break
 		}
-		topic, ok := s.dialTopicLocked(ch.c)
-		own, via := s.hostsLocked(ch.c.rec)
-		if !ok || ownBusy[own] || slices.ContainsFunc(via, func(h netip.Addr) bool { return anyBusy[h] }) {
+		topic, ok := s.dialTopicLocked(ch.c, ta, j)
+		if !ok {
 			continue
+		}
+		rec := ch.c.recOf(topic)
+		own, via := s.hostsLocked(rec)
+		if ownBusy[own] || slices.ContainsFunc(via, func(h netip.Addr) bool { return anyBusy[h] }) {
+			continue
+		}
+		if s.placesLocked() >= s.cfg.MaxPeers {
+			if s.needOf(ta, topic, j) == 2 || noVictim[topic] {
+				continue
+			}
+			victim := s.evictForLocked(topic, ta, j)
+			if victim == nil {
+				noVictim[topic] = true
+				continue
+			}
+			evicted = append(evicted, victim)
 		}
 		mark(own, via)
 		dctx, cancel := context.WithCancel(s.ctx)
 		sl := &slot{topic: topic, own: own, via: via, dial: cancel}
 		s.slots[ch.k] = sl
+		n := ta[topic]
+		n.total++
+		n.out++
+		ta[topic] = n
 		s.dialing++
-		rec, k := ch.c.rec, ch.k
+		k := ch.k
 		if s.relays != nil {
 			s.spawnLocked(func() { s.dialVia(dctx, cancel, k, sl, rec, topic) })
 		} else {
 			s.spawnLocked(func() { s.dial(dctx, cancel, k, sl, rec, topic) })
 		}
 	}
-	return max(wait, minWait)
+	return max(wait, minWait), evicted
+}
+
+// evictForLocked frees one place for a dial of topic x, which is under its outbound minimum or its fair share, and
+// returns the connection to close; nil if no peer can go. The victim is a peer that no hello holds and no Connect
+// still runs for, whose every topic keeps its fair share (and its outbound minimum, for an outbound peer of our
+// lookups) without it. Inbound peers go first, then Connect places, then outbound peers, the newest of a class first,
+// so long-lived outbound peers stay. An inbound peer of x itself may go when x lacks outbound peers: its place turns
+// outbound. The slot goes at once, so the victim's key is charged nothing. Call with mu held.
+func (s *Swarm) evictForLocked(x Topic, ta tally, j int) Conn {
+	lowOut := ta[x].out < s.minOutOf(s.topics[x], j)
+	var vk key
+	var vs *slot
+	rank := func(sl *slot) int {
+		switch {
+		case sl.inbound:
+			return 0
+		case sl.connect:
+			return 1
+		}
+		return 2
+	}
+	for k, sl := range s.slots {
+		p := sl.peer
+		if p == nil || p.gone || sl.reserved || s.helloKey[k] > 0 {
+			continue
+		}
+		out := !sl.inbound && !sl.connect
+		keeps := true
+		for _, y := range p.topics {
+			n, ty := ta[y], s.topics[y]
+			if y == x && sl.inbound && lowOut {
+				continue
+			}
+			if n.total-1 < s.shareOf(ty, j) || out && n.out-1 < s.minOutOf(ty, j) {
+				keeps = false
+				break
+			}
+		}
+		if !keeps {
+			continue
+		}
+		if vs == nil || rank(sl) < rank(vs) || rank(sl) == rank(vs) && sl.peer.admitted.After(vs.peer.admitted) {
+			vk, vs = k, sl
+		}
+	}
+	if vs == nil {
+		return nil
+	}
+	delete(s.slots, vk)
+	if vs.inbound {
+		s.inbound--
+	}
+	if vs.dial != nil {
+		vs.dial()
+	}
+	if vs.rdial != nil {
+		vs.rdial()
+	}
+	out := !vs.inbound && !vs.connect
+	for _, y := range vs.peer.topics {
+		n := ta[y]
+		n.total--
+		if vs.inbound {
+			n.inbound--
+		}
+		if out {
+			n.out--
+		}
+		ta[y] = n
+	}
+	return vs.peer.conn
 }
 
 // hostsLocked returns the IPv4 host of rec.Addr and the other hosts kolo-dht may probe or dial for rec. Call with mu
@@ -157,8 +296,12 @@ func (s *Swarm) dial(ctx context.Context, cancel context.CancelFunc, k key, sl *
 			s.release(k, sl, releaseQuiet)
 			return
 		}
-		s.release(k, sl, connectRelease(err))
-		if errors.Is(err, kolodht.ErrUnreachable) {
+		why, unreach := connectRelease(err), errors.Is(err, kolodht.ErrUnreachable)
+		if unreach && why == releaseFailed && s.rotate(k, topic, rec) {
+			why = releaseQuiet
+		}
+		s.release(k, sl, why)
+		if unreach {
 			s.unreachable(topic, rec)
 		}
 		return
@@ -201,6 +344,31 @@ func connectRelease(err error) int {
 		return releaseLater
 	}
 	return releaseFailed
+}
+
+// rotate marks k's record for topic suspect after kolodht.ErrUnreachable and reports whether k has a record of
+// another topic not suspect to dial next; if not, the round of records is over and they all count again. Only the
+// dial that ends a round is a failure of the key.
+func (s *Swarm) rotate(k key, topic Topic, rec kolodht.Record) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.cands[k]
+	if c == nil || !c.topics[topic] {
+		return false
+	}
+	if c.recOf(topic).Addr == rec.Addr {
+		if c.suspect == nil {
+			c.suspect = make(map[Topic]bool)
+		}
+		c.suspect[topic] = true
+	}
+	for x := range c.topics {
+		if x != topic && !c.suspect[x] && s.joinedLocked(x) {
+			return true
+		}
+	}
+	clear(c.suspect)
+	return false
 }
 
 func (s *Swarm) unreachable(topic Topic, rec kolodht.Record) {

@@ -15,6 +15,7 @@ import (
 
 	kolodht "github.com/ciranda-dev/kolo-dht"
 	koloid "github.com/ciranda-dev/kolo-id"
+	"github.com/ciranda-dev/kolo-swarm/internal/backoff"
 	"github.com/ciranda-dev/kolo-swarm/internal/events"
 )
 
@@ -32,6 +33,11 @@ const (
 	helloPerKey = 2
 	quickHello  = 2 * time.Second // the window for each part of the hello
 	minWait     = 10 * time.Millisecond
+
+	announceBurst    = 10 // first announcements at once, and refilled per second
+	announceRetries  = 3
+	announceRetryMin = time.Second // kolo-dht's check budget refills each second
+	announceRetryMax = 8 * time.Second
 )
 
 // Queue classes: Found and Unreachable each have their own MaxEvents budget, and RelayChanged one per listed relay.
@@ -78,7 +84,9 @@ type JoinOptions struct {
 	Announce bool
 	// Lookup finds the other peers of the topic and dials them.
 	Lookup bool
-	// MaxPeers caps the peers dialed or admitted for this topic. Default and maximum: Config.MaxPeers.
+	// MaxPeers caps the peers dialed or admitted for this topic. Zero (the default) is no cap of its own: the topic
+	// may use any free place, and when places run out it keeps a fair share of Config.MaxPeers. A positive value is
+	// at most Config.MaxPeers.
 	MaxPeers int
 }
 
@@ -98,28 +106,30 @@ type Swarm struct {
 	events   *events.Queue[Event]
 	wake     chan struct{}
 
-	mu            sync.Mutex
-	closed        bool
-	topics        map[Topic]*topicState
-	slots         map[key]*slot
-	inbound       int
-	hellos        int
-	strangers     int
-	attaching     int
-	helloKey      map[key]int
-	helloSrc      map[string]int
-	cands         map[key]*cand
-	past          map[key]*history // keys that are no longer candidates, at most MaxCandidates
-	dialing       int
-	dials         map[pair]*connectDial       // Swarm.Connect dials whose key has not proved itself yet
-	endFails      map[netip.AddrPort]*failure // Swarm.Connect backoff per address, at most twice MaxCandidates
-	pairFails     map[pair]*failure           // Swarm.Connect backoff per key and address, at most twice MaxCandidates
-	hostFloor     map[netip.Addr]time.Time    // Swarm.Connect wait per host after a failed dial, at most twice MaxCandidates
-	connectTokens float64                     // Swarm.Connect dial starts left
-	connectFill   time.Time                   // when connectTokens was last refilled
-	relayed       int                         // relay chains in progress
-	gen           generation                  // the next one the arbiter gives
-	hooks         testHooks
+	mu             sync.Mutex
+	closed         bool
+	topics         map[Topic]*topicState
+	slots          map[key]*slot
+	inbound        int
+	hellos         int
+	strangers      int
+	attaching      int
+	helloKey       map[key]int
+	helloSrc       map[string]int
+	cands          map[key]*cand
+	past           map[key]*history // keys that are no longer candidates, at most MaxCandidates
+	dialing        int
+	dials          map[pair]*connectDial       // Swarm.Connect dials whose key has not proved itself yet
+	endFails       map[netip.AddrPort]*failure // Swarm.Connect backoff per address, at most twice MaxCandidates
+	pairFails      map[pair]*failure           // Swarm.Connect backoff per key and address, at most twice MaxCandidates
+	hostFloor      map[netip.Addr]time.Time    // Swarm.Connect wait per host after a failed dial, at most twice MaxCandidates
+	connectTokens  float64                     // Swarm.Connect dial starts left
+	connectFill    time.Time                   // when connectTokens was last refilled
+	announceTokens float64                     // first announcements left
+	announceFill   time.Time                   // when announceTokens was last refilled
+	relayed        int                         // relay chains in progress
+	gen            generation                  // the next one the arbiter gives
+	hooks          testHooks
 }
 
 // New opens a kolo-dht node on addr, such as "127.0.0.1:0" or ":4000", as id, and starts the swarm on it.
@@ -309,7 +319,9 @@ func (s *Swarm) Next(ctx context.Context) (Event, error) {
 }
 
 // Join announces topic, looks it up, or both (nil opts), and connects to the peers found. With Announce it returns
-// once kolo-dht stored our record, and its errors pass through; the topic is then not joined. Lookups run every
+// once kolo-dht stored our record, and its errors pass through; the topic is then not joined. First announcements
+// are paced (at most 10 a second after a burst of 10), and kolodht.ErrNotStored is retried 3 times with jittered
+// backoff from 1s before it passes through. Lookups run every
 // LookupInterval in the background. If Leave(topic) runs during Join, Join returns context.Canceled. With Announce
 // and Config.Relays, it first waits for the first reservation attempt at each relay, in parallel, except relays known
 // down.
@@ -324,9 +336,7 @@ func (s *Swarm) Join(ctx context.Context, topic Topic, opts *JoinOptions) error 
 	switch {
 	case !o.Announce && !o.Lookup:
 		return fmt.Errorf("%w: JoinOptions needs Announce or Lookup", ErrInvalidArgument)
-	case o.MaxPeers == 0:
-		o.MaxPeers = s.cfg.MaxPeers
-	case o.MaxPeers < 1 || o.MaxPeers > s.cfg.MaxPeers:
+	case o.MaxPeers < 0 || o.MaxPeers > s.cfg.MaxPeers:
 		return fmt.Errorf("%w: JoinOptions.MaxPeers must be between 1 and MaxPeers", ErrInvalidArgument)
 	}
 	s.mu.Lock()
@@ -337,7 +347,7 @@ func (s *Swarm) Join(ctx context.Context, topic Topic, opts *JoinOptions) error 
 	case s.topics[topic] != nil:
 		s.mu.Unlock()
 		return fmt.Errorf("%w: topic already joined", ErrInvalidArgument)
-	case len(s.topics) >= s.cfg.MaxTopics:
+	case s.cfg.MaxTopics > 0 && len(s.topics) >= s.cfg.MaxTopics:
 		s.mu.Unlock()
 		return fmt.Errorf("%w: MaxTopics reached", ErrInvalidArgument)
 	}
@@ -364,7 +374,7 @@ func (s *Swarm) Join(ctx context.Context, topic Topic, opts *JoinOptions) error 
 			case <-actx.Done():
 			}
 		}
-		err = s.node.Announce(actx, topic)
+		err = s.announce(actx, topic)
 		stop()
 	}
 	s.mu.Lock()
@@ -402,6 +412,61 @@ func (s *Swarm) Join(ctx context.Context, topic Topic, opts *JoinOptions) error 
 	return err
 }
 
+// announce takes a pacing token for each Announce of topic and retries kolodht.ErrNotStored, which kolo-dht gives
+// when its 20 checked announcements a second per address run out and which a wait cures.
+func (s *Swarm) announce(ctx context.Context, topic Topic) error {
+	for n := 1; ; n++ {
+		if err := s.takeAnnounce(ctx); err != nil {
+			return err
+		}
+		var err error
+		if s.hooks.announce != nil {
+			err = s.hooks.announce(ctx, topic)
+		} else {
+			err = s.node.Announce(ctx, topic)
+		}
+		if !errors.Is(err, kolodht.ErrNotStored) || n > announceRetries {
+			return err
+		}
+		timer := time.NewTimer(backoff.Delay(n, announceRetryMin, announceRetryMax, nil))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// takeAnnounce waits for a token of the bucket that spaces first announcements: a burst of 10, then 10 a second, so
+// no 1s window sends more than the 20 checks kolo-dht allows each address.
+func (s *Swarm) takeAnnounce(ctx context.Context) error {
+	for {
+		now := time.Now()
+		s.mu.Lock()
+		if s.announceFill.IsZero() {
+			s.announceTokens = announceBurst
+		} else {
+			s.announceTokens = min(announceBurst, s.announceTokens+announceBurst*now.Sub(s.announceFill).Seconds())
+		}
+		s.announceFill = now
+		if s.announceTokens >= 1 {
+			s.announceTokens--
+			s.mu.Unlock()
+			return nil
+		}
+		wait := time.Duration((1 - s.announceTokens) / announceBurst * float64(time.Second))
+		s.mu.Unlock()
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 // mergeCtx returns a context canceled when a or b is.
 func mergeCtx(a, b context.Context) (context.Context, func()) {
 	ctx, cancel := context.WithCancel(a)
@@ -412,8 +477,8 @@ func mergeCtx(a, b context.Context) (context.Context, func()) {
 	}
 }
 
-// Leave stops announcing and looking up topic, and closes the peers that share no other topic with us; with
-// Config.Relays, those closes may finish after it returns.
+// Leave stops announcing and looking up topic, and closes the peers that share no other topic with us, as far as our
+// own lookups know; with Config.Relays, those closes may finish after it returns.
 func (s *Swarm) Leave(topic Topic) {
 	s.mu.Lock()
 	t := s.topics[topic]
@@ -438,7 +503,7 @@ func (s *Swarm) Leave(topic Topic) {
 			d.cancel()
 		}
 	}
-	for _, sl := range s.slots {
+	for k, sl := range s.slots {
 		if sl.peer == nil && sl.topic == topic && sl.dial != nil {
 			sl.dial()
 		}
@@ -447,6 +512,9 @@ func (s *Swarm) Leave(topic Topic) {
 		}
 		if p := sl.peer; p != nil && slices.Contains(p.topics, topic) {
 			p.topics = slices.DeleteFunc(p.topics, func(x Topic) bool { return x == topic })
+			if len(p.topics) == 0 {
+				p.topics, _ = s.fitLocked(s.foundTopicsLocked(k), sl.inbound, sl)
+			}
 			if len(p.topics) == 0 {
 				drop = append(drop, p.conn)
 			}
@@ -502,52 +570,119 @@ func (s *Swarm) joinedLocked(topic Topic) bool {
 // placesLocked counts the places in MaxPeers: slots and Connect dials not proved yet. Call with mu held.
 func (s *Swarm) placesLocked() int { return len(s.slots) + len(s.dials) }
 
-// countsLocked returns the peers and dials of topic, and the inbound peers among them. Call with mu held.
-func (s *Swarm) countsLocked(topic Topic) (total, inbound int) {
+// outboundMin is the outbound places a looked-up topic keeps, kolo-gossip's mesh degree D.
+const outboundMin = 6
+
+// count is what one topic holds: its peers and dials, the inbound peers among them, and the outbound ones that our
+// lookups chose.
+type count struct{ total, inbound, out int }
+
+type tally map[Topic]count
+
+// tallyLocked counts every topic's places in one pass. Call with mu held.
+func (s *Swarm) tallyLocked() tally {
+	ta := make(tally)
 	for _, d := range s.dials {
-		if d.topic == topic {
-			total++
-		}
+		n := ta[d.topic]
+		n.total++
+		ta[d.topic] = n
 	}
 	for _, sl := range s.slots {
-		switch {
-		case sl.peer != nil && slices.Contains(sl.peer.topics, topic):
-			total++
-			if sl.inbound {
-				inbound++
+		out := !sl.inbound && !sl.connect
+		if sl.peer == nil {
+			n := ta[sl.topic]
+			n.total++
+			if out {
+				n.out++
 			}
-		case sl.peer == nil && sl.topic == topic:
-			total++
+			ta[sl.topic] = n
+			continue
+		}
+		for _, x := range sl.peer.topics {
+			n := ta[x]
+			n.total++
+			if sl.inbound {
+				n.inbound++
+			}
+			if out {
+				n.out++
+			}
+			ta[x] = n
 		}
 	}
-	return total, inbound
+	return ta
+}
+
+// countsLocked returns the peers and dials of topic, and the inbound peers among them. Call with mu held.
+func (s *Swarm) countsLocked(topic Topic) (total, inbound int) {
+	n := s.tallyLocked()[topic]
+	return n.total, n.inbound
+}
+
+// capOf is the most places topic t may take: its own MaxPeers, else all of them.
+func (s *Swarm) capOf(t *topicState) int {
+	if t.opts.MaxPeers > 0 {
+		return t.opts.MaxPeers
+	}
+	return s.cfg.MaxPeers
 }
 
 // inboundCap is the inbound share of a topic's limit, MaxInbound/MaxPeers of it rounded up.
 func (s *Swarm) inboundCap(t *topicState) int {
-	return max(1, (t.opts.MaxPeers*s.cfg.MaxInbound+s.cfg.MaxPeers-1)/s.cfg.MaxPeers)
+	p := int64(s.cfg.MaxPeers)
+	return max(1, int((int64(s.capOf(t))*int64(s.cfg.MaxInbound)+p-1)/p))
 }
 
-// roomLocked reports whether topic x has room for one more peer. Call with mu held.
-func (s *Swarm) roomLocked(x Topic, inbound bool) bool {
+// joinedCountLocked counts the joined topics. Call with mu held.
+func (s *Swarm) joinedCountLocked() int {
+	n := 0
+	for _, t := range s.topics {
+		if !t.left {
+			n++
+		}
+	}
+	return n
+}
+
+// shareOf is the fair share of topic t when j topics are joined: its cap, or the places divided by j if lower.
+func (s *Swarm) shareOf(t *topicState, j int) int {
+	return max(1, min(s.capOf(t), s.cfg.MaxPeers/max(1, j)))
+}
+
+// minOutOf is the outbound places of our lookups topic t keeps: outboundMin, or its share if lower; none without Lookup.
+func (s *Swarm) minOutOf(t *topicState, j int) int {
+	if !t.opts.Lookup {
+		return 0
+	}
+	return min(outboundMin, s.shareOf(t, j))
+}
+
+// roomIn reports whether topic x has room for one more peer under the counts in ta.
+func (s *Swarm) roomIn(ta tally, x Topic, inbound bool) bool {
 	t := s.topics[x]
 	if t == nil || t.left {
 		return false
 	}
-	total, in := s.countsLocked(x)
-	return total < t.opts.MaxPeers && (!inbound || in < s.inboundCap(t))
+	n := ta[x]
+	return n.total < s.capOf(t) && (!inbound || n.inbound < s.inboundCap(t))
+}
+
+// roomLocked reports whether topic x has room for one more peer. Call with mu held.
+func (s *Swarm) roomLocked(x Topic, inbound bool) bool {
+	return s.roomIn(s.tallyLocked(), x, inbound)
 }
 
 // fitLocked returns the joined topics with room for a connection on slot sl (nil if new), keeping those sl already
 // holds; joined reports whether any of topics is joined. Call with mu held.
 func (s *Swarm) fitLocked(topics []Topic, inbound bool, sl *slot) (kept []Topic, joined bool) {
+	ta := s.tallyLocked()
 	for _, x := range topics {
 		if !s.joinedLocked(x) {
 			continue
 		}
 		joined = true
 		held := sl != nil && ((sl.peer != nil && slices.Contains(sl.peer.topics, x)) || (sl.peer == nil && sl.topic == x))
-		if held || s.roomLocked(x, inbound) {
+		if held || s.roomIn(ta, x, inbound) {
 			kept = append(kept, x)
 		}
 	}

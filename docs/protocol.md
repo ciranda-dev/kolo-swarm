@@ -11,7 +11,10 @@
   joined topic is refused.
 - A peer's topics, on each side: (topics our lookups found it on ∪ the
   topic of our `Connect` dial of it ∪ topics in its hello) ∩ topics we
-  joined. A peer learns only the topics it announced or put in its own
+  joined. A hello or reply carries at most 32 topics, but the union is not cut:
+  a pair that shares 40 topics counts on all 40 on each side. A hello
+  lists first the topics where the peer is most needed, those furthest
+  below their fair share. A peer learns only the topics it announced or put in its own
   hello, that we looked it up on them, and the topic we dialed it for.
 - Dedup: the smaller key (byte order) arbitrates. It reads the other
   side's hello, admits or refuses the connection, and answers only on the
@@ -33,7 +36,9 @@
   hello for it. A dial in progress is canceled when an inbound connection
   from that key is admitted; a relayed admission cancels only the relay
   dials, so a direct `Connect` still running can replace it.
-- Limits: `MaxPeers` counts peers and dials together. `MaxInbound` keeps
+- Limits: `MaxPeers` counts peers and dials together. At zero it is the
+  most places whose windows fit kolo-transport's `MaxMemory` check (1258 at
+  the defaults). `MaxInbound` keeps
   part of the slots for peers we chose (lookups or `Connect`), against
   eclipse attacks (Heilman et al.), and `MaxConnectPeers` caps the
   `Connect` places, whose addresses peers may supply, so at least
@@ -42,7 +47,21 @@
   split: inbound peers take at most ceil(`JoinOptions.MaxPeers` ×
   `MaxInbound` / `MaxPeers`) of its places, so peers that connect to us
   and claim a topic cannot fill it, and the topic keeps looking up and
-  dialing for the rest. With a topic `MaxPeers` of 1, or `MaxInbound`
+  dialing for the rest. A topic may take any free place up to its limit
+  (`JoinOptions.MaxPeers`, else `MaxPeers`). With J topics joined, its fair
+  share is its limit or `MaxPeers` / J if lower, and a topic joined with
+  `Lookup` also keeps min(6, share) outbound places that our own lookups
+  chose, 6 being kolo-gossip's mesh degree. When no place is free, a dial
+  for a topic below its share or its outbound minimum may close one
+  connected peer: not a peer in a hello or a place `Connect` still holds,
+  and none whose other topics would fall below their share (below their
+  outbound minimum, for an outbound peer of our lookups). Inbound peers go
+  first, then `Connect` places, then outbound peers, the newest of each
+  first, so long-lived outbound peers stay; a topic short of outbound
+  places may replace its own inbound peers. The close uses code 3, the
+  peer's `Lost` carries `ErrClosed`, and the key's backoff is not charged. An
+  inbound connection never closes a peer. Dials go first to the
+  topics furthest below their minimum, then below their share. With a topic `MaxPeers` of 1, or `MaxInbound`
   equal to `MaxPeers`, no place is kept for dials. A peer counts in each
   topic it shares that had room when it was admitted. A connection with no
   such topic is closed with code 3, before its hello when possible.
@@ -89,15 +108,20 @@
   `Unreachable` event.
 - A key's failure count, wait and lasting-connection mark survive it
   leaving the candidates and coming back. The swarm keeps them for keys
-  that are no longer candidates, up to twice `MaxCandidates`; then it keeps
-  the `MaxCandidates` strongest: keys with a connection that lasted, fewest
+  that are no longer candidates, up to twice the candidate budget; then it keeps
+  the budget's strongest: keys with a connection that lasted, fewest
   failures first, then other keys, most failures first, then the latest
   wait end. So a key that keeps failing is dialed with growing delays up
   to `RetryMax` however often lookups return it, unless `MaxCandidates`
   other dropped keys with as much or more to keep push it out.
 - Candidates are the keys of each topic's latest lookup: per topic at
-  most `MaxCandidates` divided by the number of joined topics, and
-  `MaxCandidates` in all. Half of a topic's share, rounded up, is kept for
+  most the budget divided by the number of joined topics, and the budget
+  in all. The budget is `MaxCandidates` if set, else the larger of 1024, 64
+  per joined topic and `MaxPeers`. A key keeps the record each topic's
+  lookup returned: a dial uses one of them, and a record that fails with
+  `ErrUnreachable` while the key has another not failed is no failure of the
+  key, so a peer that left some topics is redialed through one it still
+  announces. Half of a topic's share, rounded up, is kept for
   known keys: first keys admitted now on an outbound connection, then keys
   with an outbound connection that lasted 15s, ended or not, fewest
   failures first. The rest of the share, with any place the known keys

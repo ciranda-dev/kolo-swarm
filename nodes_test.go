@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -83,16 +84,18 @@ func TestParseNodesRefuses(t *testing.T) {
 	}
 }
 
-func TestParseNodesLimit(t *testing.T) {
-	var list []string
-	for i := range maxNodes {
-		list = append(list, fmt.Sprintf("10.0.0.%d:7447", i+1))
-	}
-	if got, err := ParseNodes(strings.Join(list, ",")); err != nil || len(got) != maxNodes {
-		t.Fatalf("%d nodes: %d, %v", maxNodes, len(got), err)
-	}
-	if _, err := ParseNodes(strings.Join(append(list, "10.0.1.1:7447"), ",")); !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("%d nodes: %v, want ErrInvalidArgument", maxNodes+1, err)
+func TestParseNodesMany(t *testing.T) {
+	for _, n := range []int{17, 100} {
+		var list []string
+		for i := range n {
+			list = append(list, fmt.Sprintf("10.0.%d.%d:7447", i/200, i%200+1))
+		}
+		if got, err := ParseNodes(strings.Join(list, ",")); err != nil || len(got) != n {
+			t.Fatalf("%d nodes: %d, %v", n, len(got), err)
+		}
+		if got, err := checkNodes(list); err != nil || len(got) != n {
+			t.Fatalf("%d nodes in Config: %d, %v", n, len(got), err)
+		}
 	}
 	// Duplicates do not count, and an invalid entry after many duplicates is still found.
 	dups := strings.Repeat("10.0.0.1:7447,", 1000)
@@ -216,7 +219,7 @@ func TestResolveNodesCaps(t *testing.T) {
 
 	// 16 names of 8 addresses are 128; the cap keeps 64, and a literal listed last is among them.
 	var nodes []string
-	for i := range maxNodes - 1 {
+	for i := range maxResolving - 1 {
 		name := fmt.Sprintf("n%d.test", i)
 		r[name] = many(byte(10+i), maxAddrsPerName)
 		nodes = append(nodes, name+":7447")
@@ -271,13 +274,54 @@ func (hangResolver) LookupNetIP(ctx context.Context, _, _ string) ([]netip.Addr,
 	return nil, ctx.Err()
 }
 
+// countingResolver answers every name with 8 addresses after 20ms and counts the lookups, and most at once.
+type countingResolver struct {
+	mu                sync.Mutex
+	started, now, top int
+}
+
+func (r *countingResolver) LookupNetIP(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+	r.mu.Lock()
+	r.started++
+	r.now++
+	r.top = max(r.top, r.now)
+	n := r.started
+	r.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+	r.mu.Lock()
+	r.now--
+	r.mu.Unlock()
+	var out []netip.Addr
+	for i := range maxAddrsPerName {
+		out = append(out, netip.AddrFrom4([4]byte{10, 3, byte(n), byte(i + 1)}))
+	}
+	return out, nil
+}
+
+// TestResolveNodesWindow: 100 names are resolved 16 at a time, and no name starts once 64 addresses are held.
+func TestResolveNodesWindow(t *testing.T) {
+	r := &countingResolver{}
+	useResolver(t, r)
+	var nodes []string
+	for i := range 100 {
+		nodes = append(nodes, fmt.Sprintf("n%d.test:7447", i))
+	}
+	got, err := resolveNodes(testCtx(t, 30*time.Second), nodes, netip.MustParseAddr("10.0.0.1"))
+	if err != nil || len(got) != maxBootAddrs {
+		t.Fatalf("resolved %d addresses, %v; want %d", len(got), err, maxBootAddrs)
+	}
+	if r.top > 16 || r.started > 32 {
+		t.Fatalf("%d names at once, %d started; want at most 16 and 32", r.top, r.started)
+	}
+}
+
 func TestResolveNodesHangingNames(t *testing.T) {
 	useResolver(t, hangResolver{})
 	old := nodeHooks.resolveTimeout
 	nodeHooks.resolveTimeout = 200 * time.Millisecond
 	t.Cleanup(func() { nodeHooks.resolveTimeout = old })
 	nodes := []string{"10.0.0.9:1"}
-	for i := range maxNodes - 1 {
+	for i := range maxResolving - 1 {
 		nodes = append(nodes, fmt.Sprintf("hang%d.test:7447", i))
 	}
 	start := time.Now()
@@ -286,7 +330,7 @@ func TestResolveNodesHangingNames(t *testing.T) {
 		t.Fatalf("resolved %v, %v; want only the literal", got, err)
 	}
 	if d := time.Since(start); d > 2*time.Second {
-		t.Fatalf("%d hanging names took %v; want about one timeout of %v", maxNodes-1, d, nodeHooks.resolveTimeout)
+		t.Fatalf("%d hanging names took %v; want about one timeout of %v", maxResolving-1, d, nodeHooks.resolveTimeout)
 	}
 	// The caller's deadline ends it sooner.
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -421,9 +465,6 @@ func FuzzParseNodes(f *testing.F) {
 			}
 			return
 		}
-		if len(got) > maxNodes {
-			t.Fatalf("%d nodes", len(got))
-		}
 		again, err := ParseNodes(strings.Join(got, ","))
 		if err != nil || !slices.Equal(again, got) {
 			t.Fatalf("%q parses again as %q, %v", got, again, err)
@@ -490,14 +531,13 @@ func TestLoadNodesRefuses(t *testing.T) {
 		}
 	}
 	var lines []string
-	for i := range maxNodes + 1 {
+	for i := range 100 {
 		lines = append(lines, fmt.Sprintf("10.0.0.%d:7447", i+1))
 	}
-	if _, err := LoadNodes(writeNodeFile(t, strings.Join(lines[:maxNodes], "\n"))); err != nil {
-		t.Fatalf("%d lines: %v", maxNodes, err)
-	}
-	if _, err := LoadNodes(writeNodeFile(t, strings.Join(lines, "\n"))); !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("%d lines: %v, want ErrInvalidArgument", maxNodes+1, err)
+	for _, n := range []int{17, 100} {
+		if got, err := LoadNodes(writeNodeFile(t, strings.Join(lines[:n], "\n"))); err != nil || len(got) != n {
+			t.Fatalf("%d lines: %d, %v", n, len(got), err)
+		}
 	}
 	fits := "127.0.0.1:7447\n" + strings.Repeat("#", maxNodeFile-len("127.0.0.1:7447\n"))
 	if got, err := LoadNodes(writeNodeFile(t, fits)); err != nil || len(got) != 1 {
@@ -527,9 +567,6 @@ func FuzzParseNodeFile(f *testing.F) {
 				t.Fatalf("error %v with %q", err, got)
 			}
 			return
-		}
-		if len(got) > maxNodes {
-			t.Fatalf("%d nodes", len(got))
 		}
 		again, err := ParseNodes(strings.Join(got, ","))
 		if err != nil || !slices.Equal(again, got) {

@@ -22,7 +22,7 @@ func TestConfigDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := Config{
-		MaxPeers: 64, MaxInbound: 32, MaxConnectPeers: 16, MaxTopics: 16, MaxConnecting: 3, MaxHandshakes: 16, MaxHandshakesPerIP: 4, MaxCandidates: 1024,
+		MaxPeers: 1258, MaxInbound: 629, MaxConnectPeers: 314, MaxConnecting: 3, MaxHandshakes: 16, MaxHandshakesPerIP: 4,
 		MaxEvents: 64, HelloTimeout: 10 * time.Second, LookupInterval: 10 * time.Minute, RetryMin: time.Second, RetryMax: 10 * time.Minute,
 	}
 	got := c
@@ -30,7 +30,10 @@ func TestConfigDefaults(t *testing.T) {
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("defaults\n got %+v\nwant %+v", got, want)
 	}
-	if c.DHT == nil || c.DHT.MaxAnnouncements != 16 {
+	if c.DHT == nil || c.DHT.MaxAnnouncements != 0 {
+		t.Fatalf("DHT.MaxAnnouncements with no MaxTopics: %+v", c.DHT)
+	}
+	if c, _ := (&Config{MaxTopics: 7}).withDefaults(); c.DHT.MaxAnnouncements != 7 {
 		t.Fatalf("DHT.MaxAnnouncements not set to MaxTopics: %+v", c.DHT)
 	}
 	if c, _ := (&Config{MaxPeers: 5}).withDefaults(); c.MaxInbound != 3 {
@@ -51,9 +54,10 @@ func TestConfigDefaults(t *testing.T) {
 
 func TestConfigRanges(t *testing.T) {
 	bad := []Config{
-		{MaxPeers: -1}, {MaxPeers: 1025},
+		{MaxPeers: -1},
 		{MaxPeers: 4, MaxInbound: 5}, {MaxInbound: -1},
-		{MaxTopics: 33}, {MaxConnecting: 17}, {MaxHandshakes: 257}, {MaxCandidates: 15}, {MaxCandidates: 32769},
+		{MaxTopics: -1}, {MaxConnecting: 17}, {MaxHandshakes: 257}, {MaxCandidates: 15}, {MaxCandidates: -1},
+		{DHT: &kolodht.Config{MaxAnnouncements: 5}},
 		{MaxEvents: 15}, {MaxEvents: 4097},
 		{HelloTimeout: time.Millisecond}, {HelloTimeout: 2 * time.Minute},
 		{LookupInterval: 999 * time.Millisecond}, {LookupInterval: 2 * time.Hour},
@@ -61,7 +65,7 @@ func TestConfigRanges(t *testing.T) {
 		{RetryMin: time.Second, RetryMax: 500 * time.Millisecond}, {RetryMax: 2 * time.Hour},
 		{MaxTopics: 20, DHT: &kolodht.Config{MaxAnnouncements: 19}},
 		{MaxHandshakesPerIP: -1}, {MaxHandshakes: 8, MaxHandshakesPerIP: 9},
-		{MaxConnectPeers: -1}, {MaxConnectPeers: 33}, {MaxPeers: 4, MaxConnectPeers: 3}, {MaxPeers: 2, MaxInbound: 2, MaxConnectPeers: 1},
+		{MaxConnectPeers: -1}, {MaxPeers: 64, MaxConnectPeers: 33}, {MaxPeers: 4, MaxConnectPeers: 3}, {MaxPeers: 2, MaxInbound: 2, MaxConnectPeers: 1},
 	}
 	for _, c := range bad {
 		if _, err := c.withDefaults(); !errors.Is(err, ErrInvalidConfig) {
@@ -72,9 +76,9 @@ func TestConfigRanges(t *testing.T) {
 		t.Errorf("MaxConnectPeers with no room: %v", err)
 	}
 	good := []Config{
-		{MaxPeers: 1}, {MaxPeers: 1024, MaxInbound: 1024}, {MaxTopics: 32}, {MaxConnecting: 16}, {MaxHandshakes: 256},
-		{MaxCandidates: 16}, {MaxCandidates: 32768}, {MaxEvents: 4096}, {HelloTimeout: time.Second}, {LookupInterval: time.Hour},
-		{RetryMin: 100 * time.Millisecond, RetryMax: 100 * time.Millisecond}, {DHT: &kolodht.Config{MaxAnnouncements: 200}},
+		{MaxPeers: 1}, {MaxPeers: 1024, MaxInbound: 1024}, {MaxPeers: 5000}, {MaxTopics: 1000}, {MaxConnecting: 16}, {MaxHandshakes: 256},
+		{MaxCandidates: 16}, {MaxCandidates: 100000}, {MaxEvents: 4096}, {HelloTimeout: time.Second}, {LookupInterval: time.Hour},
+		{RetryMin: 100 * time.Millisecond, RetryMax: 100 * time.Millisecond}, {MaxTopics: 16, DHT: &kolodht.Config{MaxAnnouncements: 200}},
 		{MaxHandshakes: 256, MaxHandshakesPerIP: 256}, {MaxHandshakes: 2},
 		{MaxConnectPeers: 1}, {MaxConnectPeers: 32}, {MaxPeers: 4, MaxConnectPeers: 2},
 	}
@@ -91,7 +95,7 @@ func TestConfigTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	tc := c.DHT.Secure.Transport
-	if tc.MaxDialed != 64+16+64 || tc.MaxConns != 32+16+64 || tc.MaxMemory != kolotransport.DefaultMaxMemory {
+	if tc.MaxDialed != 1258+16+64 || tc.MaxConns != 629+16+64 || tc.MaxMemory != kolotransport.DefaultMaxMemory {
 		t.Fatalf("default transport: MaxDialed %d, MaxConns %d, MaxMemory %d", tc.MaxDialed, tc.MaxConns, tc.MaxMemory)
 	}
 	c, err = (&Config{MaxPeers: 1024, MaxInbound: 1024}).withDefaults()
@@ -111,8 +115,42 @@ func TestConfigTransport(t *testing.T) {
 		t.Fatalf("set transport fields changed: %+v", tc)
 	}
 	c, _ = (&Config{DHT: &kolodht.Config{Secure: &kolosecure.Config{MaxPending: 8}}}).withDefaults()
-	if tc = c.DHT.Secure.Transport; tc.MaxDialed != 64+16+8 {
-		t.Fatalf("MaxDialed with MaxPending 8 = %d", tc.MaxDialed)
+	if tc = c.DHT.Secure.Transport; tc.MaxDialed != 1333+16+8 {
+		t.Fatalf("MaxDialed with MaxPending 8 = %d, want %d", tc.MaxDialed, 1333+16+8)
+	}
+}
+
+func TestPlaceBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name                                   string
+		cfg                                    Config
+		peers, inbound, connect, dialed, conns int
+	}{
+		{"defaults", Config{}, 1258, 629, 314, 1338, 709},
+		{"window growth", Config{DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: &kolotransport.Config{WindowGrowth: true}}}}, 1173, 587, 293, 1253, 667},
+		{"MaxInbound set", Config{MaxInbound: 100}, 1888 - 100, 100, 447, 1888 - 100 + 80, 100 + 80},
+		{"smaller MaxMemory", Config{DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: &kolotransport.Config{MaxMemory: 256 << 20}}}}, 234, 117, 58, 314, 197},
+		{"set MaxPeers", Config{MaxPeers: 5000}, 5000, 2500, 1250, 5080, 2580},
+	} {
+		c, err := tc.cfg.withDefaults()
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		tr := c.DHT.Secure.Transport
+		if c.MaxPeers != tc.peers || c.MaxInbound != tc.inbound || c.MaxConnectPeers != tc.connect || tr.MaxDialed != tc.dialed || tr.MaxConns != tc.conns {
+			t.Errorf("%s: MaxPeers %d, MaxInbound %d, MaxConnectPeers %d, MaxDialed %d, MaxConns %d; want %d, %d, %d, %d, %d",
+				tc.name, c.MaxPeers, c.MaxInbound, c.MaxConnectPeers, tr.MaxDialed, tr.MaxConns, tc.peers, tc.inbound, tc.connect, tc.dialed, tc.conns)
+		}
+		if tr.MaxMemory < int64(tr.MaxDialed+tr.MaxConns)*kolotransport.DefaultMaxConnReceiveWindow {
+			t.Errorf("%s: MaxMemory %d is below the windows", tc.name, tr.MaxMemory)
+		}
+	}
+	if _, err := (&Config{MaxInbound: 1000}).withDefaults(); !errors.Is(err, ErrInvalidConfig) {
+		t.Errorf("MaxInbound above the derived places: %v", err)
+	}
+	small := &kolotransport.Config{MaxConnReceiveWindow: 64 << 10}
+	if c, err := (&Config{DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: small}}}).withDefaults(); err != nil || c.DHT.Secure.Transport.MaxDialed > 10000 {
+		t.Errorf("small windows: %v, %+v", err, c.DHT.Secure.Transport)
 	}
 }
 
@@ -147,8 +185,9 @@ func TestNewErrors(t *testing.T) {
 	if !errors.Is(err, ErrInvalidConfig) || !errors.Is(err, kolodht.ErrInvalidConfig) {
 		t.Fatalf("kolo-dht config error: %v", err)
 	}
-	if _, err := New(ctx, "127.0.0.1:0", ident(t), &Config{MaxPeers: 1025}); !errors.Is(err, ErrInvalidConfig) {
-		t.Fatalf("bad MaxPeers: %v", err)
+	tiny := &Config{DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: &kolotransport.Config{MaxMemory: 64 << 20}}}}
+	if _, err := New(ctx, "127.0.0.1:0", ident(t), tiny); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("a MaxMemory that leaves no place: %v", err)
 	}
 }
 
@@ -159,7 +198,7 @@ func TestJoinErrors(t *testing.T) {
 	cfg.MaxTopics = 2
 	s := newSwarm(t, srv, nil, cfg)
 	ctx := testCtx(t, 10*time.Second)
-	bad := []*JoinOptions{{}, {Announce: true, MaxPeers: -1}, {Lookup: true, MaxPeers: 65}}
+	bad := []*JoinOptions{{}, {Announce: true, MaxPeers: -1}, {Lookup: true, MaxPeers: s.cfg.MaxPeers + 1}}
 	for _, o := range bad {
 		if err := s.Join(ctx, topicOf("x"), o); !errors.Is(err, ErrInvalidArgument) {
 			t.Errorf("%+v: %v", o, err)

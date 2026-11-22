@@ -10,7 +10,7 @@ Join a Kolo topic and keep connections to the peers found on it.
 
 kolo-swarm keeps connections to the peers of a topic, preferring direct paths and using a relay last, as [ICE (RFC 8445)](https://www.rfc-editor.org/info/rfc8445) does, and bounds connections per address against the eclipse attacks described by [Heilman et al.](https://www.usenix.org/conference/usenixsecurity15/technical-sessions/presentation/heilman)
 
-A `Swarm` runs its own [kolo-dht](https://github.com/ciranda-dev/kolo-dht) node. It announces and looks up the topics it joined, dials the peers it finds with backoff and jitter, accepts the peers that dial it, and keeps at most one [kolo-secure](https://github.com/ciranda-dev/kolo-secure) connection per remote key, within fixed limits on peers, inbound peers, dials and handshakes.
+A `Swarm` runs its own [kolo-dht](https://github.com/ciranda-dev/kolo-dht) node. It announces and looks up the topics it joined, dials the peers it finds with backoff and jitter, accepts the peers that dial it, and keeps at most one [kolo-secure](https://github.com/ciranda-dev/kolo-secure) connection per remote key, within limits on peers, inbound peers, dials and handshakes that default to what the transport's memory check allows.
 
 It uses relays only when `Config.Relays` lists some: then a peer it cannot reach directly is dialed through a [kolo-relay](https://github.com/ciranda-dev/kolo-relay) that both peers list, still end to end encrypted. `Connect` dials a known key at a known address, such as one another peer supplied. A connection the application opened another way enters through `Attach`, and it must already authenticate the remote key, as kolo-secure does.
 
@@ -141,7 +141,7 @@ A real deployment bootstraps from a few kolo-dht servers, such as kolo-node: a p
 | `New` | Open a kolo-dht node as an identity and start the swarm |
 | `Swarm.Bootstrap` | Ping kolo-dht servers and fill the routing table |
 | `ParseNodes`, `LoadNodes`, `Config.BootstrapNodes` | Parse bootstrap nodes (`host:port`, IPv4 or a host name) from a comma-separated list or a file, for `Bootstrap` to use when given no servers |
-| `Swarm.Join`, `Swarm.Leave` | Join a 32-byte topic to announce it, look it up, or both; stop and close peers that share no other topic |
+| `Swarm.Join`, `Swarm.Leave` | Join a 32-byte topic to announce it, look it up, or both; stop and close peers that share no other topic we know of |
 | `Swarm.Next` | Return the next event: `Found`, `Connected`, `Unreachable`, `Lost` or `RelayChanged` |
 | `Swarm.Attach` | Hand the swarm a connection the application opened itself |
 | `Swarm.Connect` | Dial a known key at a known IPv4 address for a joined topic, given the peer that supplied the address, within the limits of any dial and its own (`MaxConnectPeers`, a dial rate, a backoff per address and pair, a wait per host) |

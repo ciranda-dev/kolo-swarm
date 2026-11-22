@@ -9,7 +9,7 @@ var (
 	// ErrInvalidConfig means a Config field is out of range, here or in kolo-dht (whose error is wrapped).
 	ErrInvalidConfig = errors.New("koloswarm: invalid config")
 	// ErrInvalidArgument means a nil identity or Conn, an IPv6 address (kolo-swarm is IPv4 only), invalid JoinOptions, a
-	// topic already joined, MaxTopics reached, or a Connect key, topic or address that cannot be used.
+	// topic already joined, a MaxTopics the application set reached, or a Connect key, topic or address that cannot be used.
 	ErrInvalidArgument = errors.New("koloswarm: invalid argument")
 	// ErrClosed means the swarm is closed.
 	ErrClosed = errors.New("koloswarm: closed")

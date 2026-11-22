@@ -631,6 +631,9 @@ func (s *Swarm) endPath(k key, sl *slot, rec kolodht.Record, topic Topic, why in
 	if !last {
 		return
 	}
+	if unreach && why == releaseFailed && s.rotate(k, topic, rec) {
+		why = releaseQuiet
+	}
 	s.release(k, sl, why)
 	if unreach {
 		s.unreachable(topic, rec)
