@@ -449,15 +449,19 @@ How two peers meet:
   and `Unreachable` comes, as for a peer that is offline. Applications
   that need it compare lists over an authenticated message after first
   contact.
-- On first contact the relays are tried only after the direct `Connect`
-  failed (not when it answered try later). A key that needed a relay
+- On first contact the relays are tried once the direct `Connect` failed
+  (not when it answered try later), or once it ran for kolo-dht's punch
+  window of two consistent mappings, 10s of probes plus twice
+  `DHT.RequestTimeout` (12s at the defaults), whichever comes first. That
+  `Connect` keeps running, and if it connects, the direct connection
+  replaces the relayed one. A key that needed a relay
   before is dialed directly and through its relays at once, so a pair
   whose relayed session ended comes back after one relay dial, and a
   direct connection that succeeds replaces the relayed one (`Lost` with
   `ErrDuplicate`, then `Connected` with `Direct()` true).
-- First contact can take up to 3 × kolo-dht `PunchTimeout` (135s at its
-  default) when punches start but never connect, then one relay dial of
-  at most 60s per relay tried.
+- First contact through a relay therefore takes at most the punch window
+  (12s) plus one relay dial of at most 60s per relay tried, 72s with one
+  relay that connects, when punches start but never connect.
 
 Relayed connections use the swarm's own `DHT.Secure` settings, its
 `Transport` included, so a relayed connection has the same stream limits

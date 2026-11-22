@@ -234,6 +234,112 @@ func TestRelayFirstContactSequential(t *testing.T) {
 	}
 }
 
+func TestRelayFirstContactAfterPunchWindow(t *testing.T) {
+	checkGoroutines(t)
+	r := startRelay(t, nil)
+	srv := newServer(t)
+	topic := topicOf(t.Name())
+	b := newSwarm(t, srv, nil, relayConfig(r.entry()))
+	a := newSwarm(t, srv, nil, relayConfig(r.entry()))
+	a.mu.Lock()
+	a.hooks.relayAfter = 300 * time.Millisecond
+	a.mu.Unlock()
+	// The direct Connect runs as long as one through 3 storers whose punches start but never connect.
+	release := make(chan struct{})
+	newGate(a).set(b.PublicKey(), func(ctx context.Context) error {
+		select {
+		case <-release:
+			return nil
+		case <-time.After(30 * time.Second):
+			return kolodht.ErrUnreachable
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	wa, wb := watch(t, a), watch(t, b)
+	join(t, b, topic, &JoinOptions{Announce: true})
+	start := time.Now()
+	join(t, a, topic, &JoinOptions{Lookup: true})
+	waitRelayed(t, wa, b.PublicKey(), r.key)
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("relayed %v after the first Connect started, which still ran", d.Round(time.Millisecond))
+	}
+	close(release)
+	waitDirect(t, wa, b.PublicKey())
+	waitDirect(t, wb, a.PublicKey())
+}
+
+func TestRelayNotTriedWithinPunchWindow(t *testing.T) {
+	checkGoroutines(t)
+	r := startRelay(t, nil)
+	srv := newServer(t)
+	topic := topicOf(t.Name())
+	b := newSwarm(t, srv, nil, relayConfig(r.entry()))
+	a := newSwarm(t, srv, nil, relayConfig(r.entry()))
+	a.mu.Lock()
+	a.hooks.relayAfter = time.Second
+	a.mu.Unlock()
+	log := logRelays(a, nil)
+	wa := watch(t, a)
+	join(t, b, topic, &JoinOptions{Announce: true})
+	join(t, a, topic, &JoinOptions{Lookup: true})
+	waitDirect(t, wa, b.PublicKey())
+	time.Sleep(2 * time.Second)
+	if n := log.count(); n != 0 {
+		t.Fatalf("%d relay dials for a key whose direct Connect connected within the punch window", n)
+	}
+}
+
+func TestRelayInboundRelayedSkipsChain(t *testing.T) {
+	checkGoroutines(t)
+	r := startRelay(t, nil)
+	srv := newServer(t)
+	topic := topicOf(t.Name())
+	a := newSwarm(t, srv, nil, relayConfig(r.entry()))
+	b := newSwarm(t, srv, nil, relayConfig(r.entry()))
+	a.mu.Lock()
+	a.hooks.relayAfter = 2 * time.Second
+	a.mu.Unlock()
+	release, dialing := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	newGate(a).set(b.PublicKey(), func(ctx context.Context) error {
+		once.Do(func() { close(dialing) })
+		return holdUntil(release)(ctx)
+	})
+	newGate(b).set(a.PublicKey(), func(ctx context.Context) error {
+		holdUntil(dialing)(ctx)
+		return kolodht.ErrUnreachable
+	})
+	log := logRelays(a, nil)
+	wa, wb := watch(t, a), watch(t, b)
+	join(t, a, topic, nil)
+	join(t, b, topic, nil)
+	waitRelayed(t, wa, b.PublicKey(), r.key)
+	time.Sleep(3 * time.Second)
+	if n := len(log.to(b.PublicKey())); n != 0 {
+		t.Fatalf("a dialed b through the relay %d times while it held b's relayed connection", n)
+	}
+	close(release)
+	waitDirect(t, wa, b.PublicKey())
+	waitDirect(t, wb, a.PublicKey())
+}
+
+func TestRelayAfterPunchWindow(t *testing.T) {
+	for _, c := range []struct {
+		rt, want time.Duration
+	}{{0, 12 * time.Second}, {300 * time.Millisecond, 10600 * time.Millisecond}, {2 * time.Second, 14 * time.Second}} {
+		cfg := fastConfig()
+		cfg.DHT.RequestTimeout = c.rt
+		s := newSwarm(t, nil, nil, cfg)
+		s.mu.Lock()
+		got := s.relayAfterLocked()
+		s.mu.Unlock()
+		if got != c.want {
+			t.Errorf("RequestTimeout %v: relays after %v, want %v", c.rt, got, c.want)
+		}
+	}
+}
+
 func TestRelayRedialParallel(t *testing.T) {
 	checkGoroutines(t)
 	r := startRelay(t, &kolorelay.ServerConfig{MaxSessionDuration: time.Second})

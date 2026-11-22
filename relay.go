@@ -20,6 +20,9 @@ import (
 // relayLifetime is kolo-relay's close code for a reservation whose ReservationLifetime passed.
 const relayLifetime = 2
 
+// relayKeepAlive is kolo-relay's keep-alive on a connection to the relay, which a non-nil Relay replaces.
+const relayKeepAlive = 5 * time.Second
+
 // relayState is the swarm's use of one relay. Guarded by Swarm.mu, except the fields set at New.
 type relayState struct {
 	addr    string
@@ -52,11 +55,21 @@ func newRelayState(s *Swarm, rl Relay) *relayState {
 	sec := *s.cfg.DHT.Secure
 	tc := *sec.Transport
 	sec.Transport = &tc
+	// The outer leg to the relay carries every relayed byte, so it paces and buffers like the swarm's own connections.
+	// kolorelay never calls AllowWindowGrowth on it, so WindowGrowth and MaxGrown* stay off.
+	leg := &kolosecure.Config{Transport: &kolotransport.Config{
+		CongestionControl:      tc.CongestionControl,
+		MaxStreamReceiveWindow: tc.MaxStreamReceiveWindow,
+		MaxConnReceiveWindow:   tc.MaxConnReceiveWindow,
+		KeepAlivePeriod:        relayKeepAlive,
+		Datagrams:              tc.Datagrams,
+	}}
 	return &relayState{
 		addr: rl.Addr,
 		key:  rl.PublicKey,
 		cfg: &kolorelay.Config{
 			Peer:      &sec,
+			Relay:     leg,
 			AllowFunc: func(k ed25519.PublicKey) bool { return s.allow(k, netip.AddrPort{}) },
 		},
 	}
@@ -417,8 +430,24 @@ func (s *Swarm) nextRelayLocked(k key, target ed25519.PublicKey, tried map[*rela
 	return nil, false
 }
 
+// punchProbes is kolo-dht's probe schedule of two consistent mappings: 10 probes 1s apart.
+const punchProbes = 10 * time.Second
+
+// relayAfterLocked is how long a first-contact Connect runs alone before the relays are tried too: kolo-dht's punch
+// window of two consistent mappings, its probes plus twice RequestTimeout (default 1s). Call with mu held.
+func (s *Swarm) relayAfterLocked() time.Duration {
+	if s.hooks.relayAfter > 0 {
+		return s.hooks.relayAfter
+	}
+	rt := s.cfg.DHT.RequestTimeout
+	if rt == 0 {
+		rt = time.Second
+	}
+	return punchProbes + 2*rt
+}
+
 // dialVia is dial with Config.Relays: a key whose flag is set is dialed directly and through the relays at once;
-// another is dialed through the relays only after its direct Connect failed.
+// another is dialed through the relays once its direct Connect failed or outlasted the punch window.
 func (s *Swarm) dialVia(ctx context.Context, cancel context.CancelFunc, k key, sl *slot, rec kolodht.Record, topic Topic) {
 	defer func() {
 		cancel()
@@ -436,8 +465,21 @@ func (s *Swarm) dialVia(ctx context.Context, cancel context.CancelFunc, k key, s
 	if h := s.historyLocked(k); h != nil && h.relayed {
 		s.startChainLocked(k, sl, rec, topic)
 	}
+	// Past the window only a random mapping can still connect, which may take PunchTimeout per storer.
+	returned := false
+	late := time.AfterFunc(s.relayAfterLocked(), func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if !returned && ctx.Err() == nil && s.slots[k] == sl && sl.peer == nil {
+			s.startChainLocked(k, sl, rec, topic)
+		}
+	})
 	s.mu.Unlock()
 	c, err := s.connectNode(ctx, rec)
+	s.mu.Lock()
+	returned = true
+	s.mu.Unlock()
+	late.Stop()
 	if err != nil {
 		why := releaseQuiet
 		if ctx.Err() == nil {
