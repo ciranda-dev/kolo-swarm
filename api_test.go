@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +70,48 @@ func TestMaxPeersAboveTenThousand(t *testing.T) {
 	s := newSwarm(t, nil, nil, &Config{DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: &kolotransport.Config{MaxMemory: 64 << 30}}}})
 	if s.cfg.MaxPeers != 87274 {
 		t.Fatalf("a swarm built with it has MaxPeers %d", s.cfg.MaxPeers)
+	}
+}
+
+// TestMaxPeersAboveKoloTransportsOldMaximum: kolo-transport has no maximum of MaxMemory, so a swarm above 64 GiB starts.
+func TestMaxPeersAboveKoloTransportsOldMaximum(t *testing.T) {
+	s := newSwarm(t, nil, nil, &Config{DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: &kolotransport.Config{MaxMemory: 128 << 30}}}})
+	if s.cfg.MaxPeers != 174656 {
+		t.Fatalf("MaxPeers %d at 128 GiB, want 174656", s.cfg.MaxPeers)
+	}
+	c, err := (&Config{DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: &kolotransport.Config{MaxMemory: math.MaxInt64}}}}).withDefaults()
+	if err != nil || c.MaxPeers < 1 || c.MaxPeers > math.MaxInt-c.MaxHandshakes-securePending || c.DHT.Secure.Transport.MaxDialed < c.MaxPeers {
+		t.Fatalf("MaxMemory math.MaxInt64: MaxPeers %d, %v", c.MaxPeers, err)
+	}
+	if strconv.IntSize == 64 && int64(c.MaxPeers) != 11728124029503 {
+		t.Fatalf("MaxPeers %d at math.MaxInt64, want 11728124029503", c.MaxPeers)
+	}
+}
+
+func TestMaxPeersFitsAnInt(t *testing.T) {
+	most := math.MaxInt - 16 - securePending
+	if _, err := (&Config{MaxPeers: most + 1}).withDefaults(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("MaxPeers %d: %v", most+1, err)
+	}
+	c, err := (&Config{MaxPeers: most}).withDefaults()
+	if err != nil || c.DHT.Secure.Transport.MaxDialed != math.MaxInt {
+		t.Fatalf("MaxPeers %d: %v", most, err)
+	}
+}
+
+func TestDerivedMaxMemoryDoesNotWrap(t *testing.T) {
+	grow := &kolotransport.Config{WindowGrowth: true, MaxGrownMemory: math.MaxInt64}
+	c, err := (&Config{MaxPeers: 1, DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: grow}}}).withDefaults()
+	if err != nil || c.DHT.Secure.Transport.MaxMemory != math.MaxInt64 {
+		t.Fatalf("growth past an int64: MaxMemory %d, %v", c.DHT.Secure.Transport.MaxMemory, err)
+	}
+	if strconv.IntSize < 64 {
+		return
+	}
+	counts := &kolotransport.Config{MaxConns: math.MaxInt, MaxDialed: math.MaxInt}
+	c, err = (&Config{MaxPeers: 1, DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: counts}}}).withDefaults()
+	if err != nil || c.DHT.Secure.Transport.MaxMemory != math.MaxInt64 {
+		t.Fatalf("windows past an int64: MaxMemory %d, %v", c.DHT.Secure.Transport.MaxMemory, err)
 	}
 }
 

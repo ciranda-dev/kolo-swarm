@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"crypto/ed25519"
 	"fmt"
+	"math"
 	"net/netip"
 	"time"
 
@@ -21,7 +22,8 @@ type Config struct {
 	DHT *kolodht.Config
 	// MaxPeers caps connected peers plus dials in progress, inbound and outbound. Zero derives it from the
 	// kolo-transport memory check: the most places whose receive windows fit in MaxMemory, 1258 at the defaults
-	// (1173 with WindowGrowth, 822 with Datagrams). A positive value is a cap of the application.
+	// (1173 with WindowGrowth, 822 with Datagrams). A positive value is a cap of the application, at most
+	// math.MaxInt - MaxHandshakes - kolo-secure MaxPending.
 	MaxPeers int
 	// MaxInbound caps the peers that connected to us. Default MaxPeers/2 rounded up, from 1 to MaxPeers. If set while
 	// MaxPeers is zero, the places left after it are MaxPeers.
@@ -87,16 +89,8 @@ type Relay struct {
 	PublicKey ed25519.PublicKey
 }
 
-// The defaults of kolo-secure MaxPending and kolo-transport MaxDialed and MaxConns, which the swarm only raises.
-const (
-	securePending   = 64
-	transportDialed = 32
-	transportConns  = 100
-)
-
-// datagramQueueBytes is what kolo-transport's MaxMemory check counts for the datagram queues of one connection with
-// Datagrams on: 128 received and 32 queued to send, 1536 bytes each.
-const datagramQueueBytes = (128 + 32) * 1536
+// securePending is the default of kolo-secure MaxPending, which the swarm only raises.
+const securePending = 64
 
 // atLeast refuses a v that is set and below lo; zero stays for the caller to derive.
 func atLeast(name string, v, lo int) error {
@@ -153,10 +147,15 @@ func (c *Config) withDefaults() (Config, error) {
 	pending := cmp.Or(sec.MaxPending, securePending)
 	win := cmp.Or(tc.MaxConnReceiveWindow, kolotransport.DefaultMaxConnReceiveWindow)
 	if tc.Datagrams {
-		win += datagramQueueBytes
+		win += kolotransport.DatagramQueueBytes
+	}
+	// The derived kolo-transport MaxDialed is MaxPeers + MaxHandshakes + pending, which must fit an int.
+	most := math.MaxInt - out.MaxHandshakes - pending
+	if out.MaxPeers > most {
+		return Config{}, fmt.Errorf("%w: MaxPeers must be at most %d, so that the kolo-transport MaxDialed derived from it fits an int", ErrInvalidConfig, most)
 	}
 	if out.MaxPeers == 0 {
-		if err := out.derivePeers(tc, win, pending); err != nil {
+		if err := out.derivePeers(tc, win, pending, most); err != nil {
 			return Config{}, err
 		}
 	}
@@ -206,16 +205,20 @@ func (c *Config) withDefaults() (Config, error) {
 		return Config{}, fmt.Errorf("%w: DHT.MaxAnnouncements must be at least MaxTopics", ErrInvalidConfig)
 	}
 	if tc.MaxDialed == 0 {
-		tc.MaxDialed = max(transportDialed, out.MaxPeers+out.MaxHandshakes+pending)
+		tc.MaxDialed = max(kolotransport.DefaultMaxDialed, out.MaxPeers+out.MaxHandshakes+pending)
 	}
 	if tc.MaxConns == 0 {
-		tc.MaxConns = max(transportConns, out.MaxInbound+out.MaxHandshakes+pending)
+		tc.MaxConns = max(kolotransport.DefaultMaxConns, out.MaxInbound+out.MaxHandshakes+pending)
 	}
 	if tc.MaxMemory == 0 {
-		need := int64(tc.MaxConns+tc.MaxDialed) * win
+		// A sum past an int64 stays at math.MaxInt64, which kolo-transport's check then refuses.
+		need := int64(math.MaxInt64)
+		if a, b := int64(tc.MaxConns), int64(tc.MaxDialed); a <= math.MaxInt64/win-b {
+			need = (a + b) * win
+		}
 		if tc.WindowGrowth {
 			// An upper bound of the growth kolo-transport adds to its MaxMemory check.
-			need += cmp.Or(tc.MaxGrownMemory, kolotransport.DefaultMaxGrownMemory)
+			need += min(cmp.Or(tc.MaxGrownMemory, kolotransport.DefaultMaxGrownMemory), math.MaxInt64-need)
 		}
 		tc.MaxMemory = max(kolotransport.DefaultMaxMemory, need)
 	}
@@ -227,8 +230,8 @@ func (c *Config) withDefaults() (Config, error) {
 
 // derivePeers sets MaxPeers to the most places whose receive windows fit kolo-transport's MaxMemory check, the check
 // run backwards: with MaxInbound unset, P + ceil(P/2) windows beside those of the hellos and kolo-secure handshakes.
-// win is the memory of one connection, its datagram queues included.
-func (c *Config) derivePeers(tc kolotransport.Config, win int64, pending int) error {
+// win is the memory of one connection, its datagram queues included; most bounds the result.
+func (c *Config) derivePeers(tc kolotransport.Config, win int64, pending, most int) error {
 	free := cmp.Or(tc.MaxMemory, kolotransport.DefaultMaxMemory)/win - 2*int64(c.MaxHandshakes+pending)
 	if tc.WindowGrowth {
 		free -= (cmp.Or(tc.MaxGrownMemory, kolotransport.DefaultMaxGrownMemory) + win - 1) / win
@@ -240,6 +243,6 @@ func (c *Config) derivePeers(tc kolotransport.Config, win int64, pending int) er
 	if p < 1 || p < int64(c.MaxInbound) {
 		return fmt.Errorf("%w: MaxPeers 0 derives the places from MaxMemory, which leaves %d", ErrInvalidConfig, max(p, 0))
 	}
-	c.MaxPeers = int(p)
+	c.MaxPeers = int(min(p, int64(most)))
 	return nil
 }
