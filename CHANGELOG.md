@@ -29,6 +29,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- With `DHT.Secure.Transport.Datagrams` on, the derived `MaxPeers`, `MaxDialed`, `MaxConns` and `MaxMemory` count the 240 KiB of datagram queues kolo-transport's `MaxMemory` check adds per connection, so a default swarm with datagrams derives 822 places (`MaxDialed` 902, `MaxConns` 491) and starts; with that kolo-transport check it was refused with `ErrInvalidConfig`. A swarm with datagrams and a positive `MaxPeers` gets a `MaxMemory` raised to cover the queues.
 - `Leave` no longer closes a peer that our lookups found on another joined topic, when the hello had not listed it; the topics of such a peer are refilled from our lookups.
 - A key found on several topics keeps the record of each, and a dial that fails with `ErrUnreachable` through the record of a topic the peer has left is no failure of the key while another record has not failed, so the key is redialed through a topic it still announces and not left to backoff for a lookup interval.
 - A reply to a hello that lists more than 32 shared topics is cut to the 32 the wire carries, with the topics the hello listed first; it was refused as too long.
