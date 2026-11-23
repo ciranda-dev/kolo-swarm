@@ -72,6 +72,10 @@ type Config struct {
 	// the defaults), is dialed through them in turn, the one that carried it last first, with the swarm's own
 	// DHT.Secure settings. Two peers meet through any relay both list. Empty never uses a relay.
 	Relays []Relay
+	// RelayDatagrams offers QUIC datagrams on the connection to each relay, so a relay of kolo-relay's protocol version 1
+	// carries the relayed packets as datagrams. It is independent of DHT.Secure.Transport.Datagrams, which is for the
+	// direct connections.
+	RelayDatagrams bool
 }
 
 // Relay is a kolo-relay that peers of the network may list, used when a direct connection fails.
@@ -88,8 +92,6 @@ const (
 	securePending   = 64
 	transportDialed = 32
 	transportConns  = 100
-	// transportMax is the most MaxDialed and MaxConns a kolo-transport without its count-maxima removal accepts.
-	transportMax = 10000
 )
 
 // atLeast refuses a v that is set and below lo; zero stays for the caller to derive.
@@ -227,8 +229,6 @@ func (c *Config) derivePeers(tc kolotransport.Config, win int64, pending int) er
 	if c.MaxInbound > 0 {
 		p = free - int64(c.MaxInbound)
 	}
-	// Until kolo-transport has no maximum of its own, MaxDialed and MaxConns must stay within it.
-	p = min(p, transportMax-int64(c.MaxHandshakes+pending))
 	if p < 1 || p < int64(c.MaxInbound) {
 		return fmt.Errorf("%w: MaxPeers 0 derives the places from MaxMemory, which leaves %d", ErrInvalidConfig, max(p, 0))
 	}

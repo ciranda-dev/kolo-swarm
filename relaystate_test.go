@@ -11,6 +11,20 @@ import (
 	kolotransport "github.com/ciranda-dev/kolo-transport"
 )
 
+// TestRelayLegDatagrams: the relay leg follows Config.RelayDatagrams alone, not the datagrams of the direct connections.
+func TestRelayLegDatagrams(t *testing.T) {
+	for _, c := range []struct{ direct, relay bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+		s := &Swarm{cfg: Config{RelayDatagrams: c.relay, DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: &kolotransport.Config{Datagrams: c.direct}}}}}
+		cfg := newRelayState(s, Relay{}).cfg
+		if got := cfg.Relay.Transport.Datagrams; got != c.relay {
+			t.Errorf("direct %v, RelayDatagrams %v: relay leg Datagrams %v", c.direct, c.relay, got)
+		}
+		if got := cfg.Peer.Transport.Datagrams; got != c.direct {
+			t.Errorf("direct %v, RelayDatagrams %v: peer Datagrams %v", c.direct, c.relay, got)
+		}
+	}
+}
+
 func TestNewRelayStateOuterLeg(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -35,7 +49,7 @@ func TestNewRelayStateOuterLeg(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sec := &kolosecure.Config{Transport: &tc.tc}
-			s := &Swarm{cfg: Config{DHT: &kolodht.Config{Secure: sec}}}
+			s := &Swarm{cfg: Config{RelayDatagrams: true, DHT: &kolodht.Config{Secure: sec}}}
 			cfg := newRelayState(s, Relay{}).cfg
 			if cfg.Relay == nil || cfg.Relay.Transport == nil {
 				t.Fatal("no relay leg config")
@@ -46,7 +60,7 @@ func TestNewRelayStateOuterLeg(t *testing.T) {
 				MaxStreamReceiveWindow: tc.tc.MaxStreamReceiveWindow,
 				MaxConnReceiveWindow:   tc.tc.MaxConnReceiveWindow,
 				KeepAlivePeriod:        5 * time.Second,
-				Datagrams:              tc.tc.Datagrams,
+				Datagrams:              true,
 			}
 			if got.CongestionControl != want.CongestionControl || got.MaxStreamReceiveWindow != want.MaxStreamReceiveWindow ||
 				got.MaxConnReceiveWindow != want.MaxConnReceiveWindow || got.KeepAlivePeriod != want.KeepAlivePeriod || got.Datagrams != want.Datagrams {

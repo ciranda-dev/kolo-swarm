@@ -52,6 +52,25 @@ func TestConfigDefaults(t *testing.T) {
 	}
 }
 
+// TestMaxPeersAboveTenThousand: kolo-transport has no maximum of MaxConns and MaxDialed, so MaxMemory alone sets the places.
+func TestMaxPeersAboveTenThousand(t *testing.T) {
+	tc := &kolotransport.Config{MaxMemory: 64 << 30}
+	c, err := (&Config{DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: tc}}}).withDefaults()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MaxPeers != 87274 || c.MaxInbound != 43637 {
+		t.Fatalf("MaxPeers %d, MaxInbound %d, want 87274 and 43637", c.MaxPeers, c.MaxInbound)
+	}
+	if got := c.DHT.Secure.Transport; got.MaxDialed != 87354 || got.MaxConns != 43717 {
+		t.Fatalf("MaxDialed %d, MaxConns %d, want 87354 and 43717", got.MaxDialed, got.MaxConns)
+	}
+	s := newSwarm(t, nil, nil, &Config{DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: &kolotransport.Config{MaxMemory: 64 << 30}}}})
+	if s.cfg.MaxPeers != 87274 {
+		t.Fatalf("a swarm built with it has MaxPeers %d", s.cfg.MaxPeers)
+	}
+}
+
 func TestConfigRanges(t *testing.T) {
 	bad := []Config{
 		{MaxPeers: -1},
@@ -149,8 +168,9 @@ func TestPlaceBudget(t *testing.T) {
 		t.Errorf("MaxInbound above the derived places: %v", err)
 	}
 	small := &kolotransport.Config{MaxConnReceiveWindow: 64 << 10}
-	if c, err := (&Config{DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: small}}}).withDefaults(); err != nil || c.DHT.Secure.Transport.MaxDialed > 10000 {
-		t.Errorf("small windows: %v, %+v", err, c.DHT.Secure.Transport)
+	c, err := (&Config{DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: small}}}).withDefaults()
+	if tr := c.DHT.Secure.Transport; err != nil || c.MaxPeers != 10816 || tr.MaxDialed != 10896 || tr.MaxConns != 5488 {
+		t.Errorf("small windows: %v, MaxPeers %d, %+v", err, c.MaxPeers, tr)
 	}
 }
 
