@@ -6,11 +6,14 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -2427,4 +2430,30 @@ func TestConnectThirdPartyDeadline(t *testing.T) {
 	}
 	cancel()
 	waitErr(t, errc)
+}
+
+// TestConnectNoDescriptor: a dial that finds no file descriptor for its socket is refused as a limit, charges nothing
+// and does not hold the next dial back.
+func TestConnectNoDescriptor(t *testing.T) {
+	checkGoroutines(t)
+	s := newSwarm(t, nil, nil, nil)
+	dials := 0
+	s.hooks.dial = func(context.Context, netip.AddrPort, ed25519.PublicKey) (*kolosecure.Conn, error) {
+		dials++
+		return nil, fmt.Errorf("kolotransport: dial: %w", &os.SyscallError{Syscall: "socket", Err: syscall.EMFILE})
+	}
+	topic := topicOf("descriptors")
+	join(t, s, topic, &JoinOptions{Lookup: true})
+	for i := range 3 {
+		addr := netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", 4000+i))
+		err := s.Connect(testCtx(t, 5*time.Second), topic, ident(t).PublicKey(), addr, netip.MustParseAddr("127.0.0.1"))
+		if !errors.Is(err, errFull) || errors.Is(err, ErrWait) {
+			t.Fatalf("Connect %d: %v, want a refusal that is no wait", i, err)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if dials != 3 || len(s.endFails) != 0 || len(s.pairFails) != 0 || len(s.hostFloor) != 0 {
+		t.Fatalf("%d dials, backoff of %d addresses, %d pairs, %d hosts", dials, len(s.endFails), len(s.pairFails), len(s.hostFloor))
+	}
 }

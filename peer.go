@@ -62,8 +62,8 @@ func (p *Peer) Direct() bool { return p.direct }
 // the kept connection.
 func (p *Peer) Outbound() bool { return !p.inbound }
 
-// Topics returns the topics this peer currently shares with us, as far as the peer claimed them: a topic hash is
-// not secret, so any peer can claim it. Config.Allow, which sees the key, is where to admit only known members.
+// Topics returns the topics this peer currently shares with us, as far as the peer claimed them or our lookups found
+// it on, more than the 32 a hello carries if need be: a topic hash is not secret, so any peer can claim it. Config.Allow, which sees the key, is where to admit only known members.
 func (p *Peer) Topics() []Topic {
 	p.s.mu.Lock()
 	defer p.s.mu.Unlock()

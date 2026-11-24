@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"syscall"
 	"time"
 
 	kolosecure "github.com/ciranda-dev/kolo-secure"
@@ -114,7 +115,7 @@ func (s *Swarm) Connect(ctx context.Context, topic Topic, pub ed25519.PublicKey,
 	}()
 	c, err = s.dialDirect(dctx, addr, pub)
 	if err != nil {
-		refused := errors.Is(err, kolosecure.ErrInvalidArgument)
+		refused := errors.Is(err, kolosecure.ErrInvalidArgument) || exhausted(err)
 		end := connectUnproved
 		switch {
 		case refused:
@@ -435,10 +436,11 @@ func failLocked[K comparable](s *Swarm, m map[K]*failure, x K, now time.Time) {
 	capLocked(s, m, func(f *failure) time.Time { return f.next })
 }
 
-// capLocked lets m grow to twice MaxCandidates entries, then drops the ones whose wait ends soonest, expired ones
-// first, down to MaxCandidates, so a trim costs O(log n) per entry. Call with mu held.
+// capLocked lets m grow to twice the candidate budget, then drops the ones whose wait ends soonest, expired ones
+// first, down to the budget, so a trim costs O(log n) per entry. Call with mu held.
 func capLocked[K comparable, V any](s *Swarm, m map[K]V, end func(V) time.Time) {
-	if len(m) <= 2*s.cfg.MaxCandidates {
+	budget := s.budgetLocked()
+	if len(m) <= 2*budget {
 		return
 	}
 	type entry struct {
@@ -450,7 +452,7 @@ func capLocked[K comparable, V any](s *Swarm, m map[K]V, end func(V) time.Time) 
 		es = append(es, entry{y, end(v)})
 	}
 	slices.SortFunc(es, func(a, b entry) int { return a.next.Compare(b.next) })
-	for _, e := range es[:len(es)-s.cfg.MaxCandidates] {
+	for _, e := range es[:len(es)-budget] {
 		delete(m, e.x)
 	}
 }
@@ -459,6 +461,12 @@ func capLocked[K comparable, V any](s *Swarm, m map[K]V, end func(V) time.Time) 
 func backingOff[K comparable](m map[K]*failure, x K, now time.Time) bool {
 	f := m[x]
 	return f != nil && now.Before(f.next)
+}
+
+// exhausted reports whether err says the process has no file descriptor left for the dial's own UDP socket, which no
+// peer caused: the dial is refused like one past MaxConnectPeers and charges nothing.
+func exhausted(err error) bool {
+	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE)
 }
 
 // connectErr maps a Connect dial that gave no connection to its error; err is the dial's, and canceled reports that
@@ -472,6 +480,8 @@ func (s *Swarm) connectErr(ctx context.Context, topic Topic, err error, canceled
 		return ErrClosed
 	case ctx.Err() != nil:
 		return ctx.Err()
+	case exhausted(err):
+		return errFull
 	case errors.Is(err, kolosecure.ErrInvalidArgument):
 		return fmt.Errorf("%w: kolo-secure refused the key or address", ErrInvalidArgument)
 	case errors.Is(err, kolosecure.ErrUnexpectedPeer):

@@ -35,14 +35,16 @@ func TestParseRelays(t *testing.T) {
 		t.Fatalf("an empty list: %v, %v", got, err)
 	}
 	var many []string
-	for i := range maxNodes + 1 {
+	for i := range 100 {
 		many = append(many, fmt.Sprintf("10.0.0.%d:1@%s", i+1, hexKey(ident(t).PublicKey())))
 	}
-	if got, err := ParseRelays(strings.Join(many[:maxNodes], ",")); err != nil || len(got) != maxNodes {
-		t.Fatalf("%d relays: %d, %v", maxNodes, len(got), err)
-	}
-	if _, err := ParseRelays(strings.Join(many, ",")); !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("%d relays: %v", maxNodes+1, err)
+	for _, n := range []int{17, 100} {
+		if got, err := ParseRelays(strings.Join(many[:n], ",")); err != nil || len(got) != n {
+			t.Fatalf("%d relays: %d, %v", n, len(got), err)
+		}
+		if got, err := parseRelayFile([]byte(strings.Join(many[:n], "\n"))); err != nil || len(got) != n {
+			t.Fatalf("%d relays in a file: %d, %v", n, len(got), err)
+		}
 	}
 	for _, tc := range []struct{ in, where string }{
 		{"127.0.0.1:1", "relay 1"},
@@ -113,9 +115,6 @@ func FuzzParseRelays(f *testing.F) {
 				}
 				continue
 			}
-			if len(got) > maxNodes {
-				t.Fatalf("%d relays", len(got))
-			}
 			var texts []string
 			for _, r := range got {
 				texts = append(texts, relayText(r))
@@ -142,7 +141,7 @@ func TestRelaysConfig(t *testing.T) {
 		return s, err
 	}
 	var many []Relay
-	for i := range maxNodes + 1 {
+	for i := range 100 {
 		many = append(many, Relay{fmt.Sprintf("10.0.0.%d:1", i+1), ident(t).PublicKey()})
 	}
 	ok := Relay{"127.0.0.1:1", k1}
@@ -151,7 +150,6 @@ func TestRelaysConfig(t *testing.T) {
 		relays []Relay
 		where  string
 	}{
-		{"17 entries", many, "entry 17"},
 		{"one key, two addresses", []Relay{ok, {"127.0.0.1:2", k1}}, "entry 2"},
 		{"one address, two keys", []Relay{ok, {"127.0.0.1:1", k2}}, "entry 2"},
 		{"IPv6", []Relay{ok, {"[::1]:1", k2}}, "entry 2"},
@@ -170,6 +168,9 @@ func TestRelaysConfig(t *testing.T) {
 		if err != nil && strings.Contains(err.Error(), hexKey(k1)[:16]) {
 			t.Errorf("%s: error %q shows a key", tc.name, err)
 		}
+	}
+	if s, err := newWith(many); err != nil || len(s.relays) != 100 {
+		t.Fatalf("100 relays: %v", err)
 	}
 	s, err := newWith([]Relay{ok, ok, {"127.0.0.1:1", k1}})
 	if err != nil || len(s.relays) != 1 || len(s.cfg.Relays) != 1 {

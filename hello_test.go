@@ -2,10 +2,14 @@ package koloswarm
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"io"
+	"slices"
 	"testing"
 	"time"
 
+	kolodht "github.com/ciranda-dev/kolo-dht"
 	koloid "github.com/ciranda-dev/kolo-id"
 	kolosecure "github.com/ciranda-dev/kolo-secure"
 	"github.com/ciranda-dev/kolo-swarm/internal/hello"
@@ -278,5 +282,180 @@ func TestHandshakeLimits(t *testing.T) {
 	other := rawPeer(t, s, sides(t, s, true))
 	if code := closeCodeOf(t, other, time.Second); code != codeFull {
 		t.Fatalf("hello past MaxHandshakes closed with %d, want %d", code, codeFull)
+	}
+}
+
+func manyTopics(name string, n int) []Topic {
+	var out []Topic
+	for i := range n {
+		out = append(out, topicOf(fmt.Sprintf("%s %d", name, i)))
+	}
+	return out
+}
+
+// sharedPair starts two swarms, a (the arbiter) and b, that both joined every topic and know each other on all of
+// them before their first dial.
+func sharedPair(t *testing.T, topics []Topic) (a, b *Swarm, wa, wb *watcher) {
+	t.Helper()
+	srv := newServer(t)
+	ida, idb := identPair(t)
+	a, b = newSwarm(t, srv, ida, nil), newSwarm(t, srv, idb, nil)
+	gate := make(chan struct{})
+	for _, s := range []*Swarm{a, b} {
+		s.hooks.connect = func(ctx context.Context, rec kolodht.Record) (*kolosecure.Conn, error) {
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			return s.node.Connect(ctx, rec)
+		}
+	}
+	wa, wb = watch(t, a), watch(t, b)
+	for _, s := range []*Swarm{a, b} {
+		for _, x := range topics {
+			join(t, s, x, nil)
+		}
+	}
+	knows := func(s, o *Swarm) bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		c := s.cands[key(o.PublicKey())]
+		return c != nil && len(c.topics) == len(topics)
+	}
+	waitFor(t, 30*time.Second, "both swarms to know each other on every topic", func() bool { return knows(a, b) && knows(b, a) })
+	close(gate)
+	waitFor(t, 15*time.Second, "the connection", func() bool { return wa.peer(b.PublicKey()) != nil && wb.peer(a.PublicKey()) != nil })
+	return a, b, wa, wb
+}
+
+// TestHelloManySharedTopics: the hello and the reply carry 32 topics, and both sides still count the peer on all 40.
+func TestHelloManySharedTopics(t *testing.T) {
+	longTest(t)
+	checkGoroutines(t)
+	a, b, wa, wb := sharedPair(t, manyTopics("shared", 40))
+	for _, p := range []*Peer{wa.peer(b.PublicKey()), wb.peer(a.PublicKey())} {
+		if n := len(p.Topics()); n != 40 {
+			t.Errorf("a peer counted on %d topics, want 40", n)
+		}
+	}
+}
+
+// TestLeaveKeepsKnownPeer: leaving every topic a hello listed keeps a peer that our lookups found on others.
+func TestLeaveKeepsKnownPeer(t *testing.T) {
+	longTest(t)
+	checkGoroutines(t)
+	a, b, _, wb := sharedPair(t, manyTopics("leave", 40))
+	p := wb.peer(a.PublicKey())
+	all := p.Topics()
+	for _, x := range all[:32] {
+		b.Leave(x)
+	}
+	stable(t, 5*time.Second, 2*time.Second, "the peer to stay with 8 topics", func() bool {
+		got := p.Topics()
+		return p.Conn().Context().Err() == nil && len(got) == 8 && slices.Equal(got, all[32:])
+	})
+}
+
+// TestLeaveRefillsFromLookups: a peer whose list empties on Leave keeps its place if our lookups found it on another topic.
+func TestLeaveRefillsFromLookups(t *testing.T) {
+	checkGoroutines(t)
+	x, y := topicOf("x"), topicOf("y")
+	s := placeSwarm(t, nil, x, y)
+	k, f := seat(t, s, 0, false, x)
+	s.mu.Lock()
+	s.cands[k] = &cand{topics: map[Topic]bool{x: true, y: true}}
+	s.mu.Unlock()
+	s.Leave(x)
+	time.Sleep(100 * time.Millisecond)
+	if code, closed := f.code(); closed {
+		t.Fatalf("closed with code %d", code)
+	}
+	s.mu.Lock()
+	got := s.slots[k].peer.topics
+	s.mu.Unlock()
+	if len(got) != 1 || got[0] != y {
+		t.Fatalf("topics %v, want y", got)
+	}
+	s.Leave(y)
+	if code, ok := f.code(); !ok || code != codeNormal {
+		t.Fatalf("code %d, %v after the last topic was left", code, ok)
+	}
+}
+
+func TestReplyOverWireCap(t *testing.T) {
+	kept := manyTopics("kept", 40)
+	listed := rawTopics([]Topic{kept[35], kept[7], kept[20]})
+	got := replyTopics(kept, listed)
+	if len(got) != hello.MaxTopics {
+		t.Fatalf("%d topics, want %d", len(got), hello.MaxTopics)
+	}
+	if got[0] != kept[7] || got[1] != kept[20] || got[2] != kept[35] {
+		t.Fatalf("the topics the hello listed do not come first: %v", got[:3])
+	}
+	if got := replyTopics(kept[:5], nil); len(got) != 5 {
+		t.Fatalf("a short list changed: %v", got)
+	}
+}
+
+// TestRedialAfterPeerLeft: a peer that left some topics is redialed through its record of a topic it still announces,
+// and the records it left do not count as failures of its key.
+func TestRedialAfterPeerLeft(t *testing.T) {
+	longTest(t)
+	checkGoroutines(t)
+	srv := newServer(t)
+	a := newSwarm(t, srv, nil, nil)
+	cfg := fastConfig()
+	cfg.LookupInterval = time.Hour
+	b := newSwarm(t, srv, nil, cfg)
+	wa, wb := watch(t, a), watch(t, b)
+	topics := manyTopics("redial", 3)
+	for _, x := range topics {
+		join(t, a, x, &JoinOptions{Announce: true})
+	}
+	// A second peer on the live topic, so that b tries the topics a left first.
+	join(t, newSwarm(t, srv, nil, nil), topics[2], &JoinOptions{Announce: true})
+	// The last record b keeps is of a topic a leaves.
+	for _, x := range []Topic{topics[2], topics[0], topics[1]} {
+		join(t, b, x, &JoinOptions{Lookup: true})
+	}
+	waitFor(t, 15*time.Second, "the connections", func() bool { return wb.peer(a.PublicKey()) != nil && wb.count() == 2 })
+	waitFor(t, 15*time.Second, "b to know a on 3 topics", func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		c := b.cands[key(a.PublicKey())]
+		return c != nil && len(c.topics) == 3
+	})
+	a.Leave(topics[0])
+	a.Leave(topics[1])
+	old := wb.peer(a.PublicKey())
+	wa.peer(b.PublicKey()).Conn().CloseWithError(codeNormal, "")
+	waitFor(t, 5*time.Second, "the connection to end", func() bool { return wb.peer(a.PublicKey()) != old })
+	waitFor(t, 30*time.Second, "b to reconnect through the topic a still announces", func() bool { return wb.peer(a.PublicKey()) != nil })
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if f := b.cands[key(a.PublicKey())].fails; f != 1 {
+		t.Fatalf("a has %d failures, want only the one of its lost connection", f)
+	}
+}
+
+// TestRotateRounds: only the dial that ends a round of a key's records counts as its failure.
+func TestRotateRounds(t *testing.T) {
+	checkGoroutines(t)
+	x, y := topicOf("x"), topicOf("y")
+	s := placeSwarm(t, nil, x, y)
+	k := key(ident(t).PublicKey())
+	rx := kolodht.Record{Topic: x, PublicKey: k[:], Addr: fakeAddr()}
+	ry := kolodht.Record{Topic: y, PublicKey: k[:], Addr: fakeAddr()}
+	s.mu.Lock()
+	s.cands[k] = &cand{rec: ry, recs: map[Topic]kolodht.Record{x: rx, y: ry}, topics: map[Topic]bool{x: true, y: true}}
+	s.mu.Unlock()
+	for round := range 2 {
+		if !s.rotate(k, x, rx) {
+			t.Fatalf("round %d: the first record failed and the second is not suspect", round)
+		}
+		if s.rotate(k, y, ry) {
+			t.Fatalf("round %d: every record failed, and the round did not end", round)
+		}
 	}
 }

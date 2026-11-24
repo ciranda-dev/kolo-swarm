@@ -2,6 +2,7 @@ package koloswarm
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/ed25519"
 	"math/rand/v2"
 	"net/netip"
@@ -26,9 +27,19 @@ type history struct {
 
 // cand is a key returned by lookups.
 type cand struct {
-	rec    kolodht.Record
-	topics map[Topic]bool
+	rec     kolodht.Record // the latest record any lookup returned
+	recs    map[Topic]kolodht.Record
+	suspect map[Topic]bool // topics whose record failed with ErrUnreachable and no lookup returned it again since
+	topics  map[Topic]bool
 	history
+}
+
+// recOf is the record of c that a lookup of x returned.
+func (c *cand) recOf(x Topic) kolodht.Record {
+	if r, ok := c.recs[x]; ok {
+		return r
+	}
+	return c.rec
 }
 
 // lookupDelay is interval plus up to a fifth of it, for a random r in [0, 1).
@@ -40,7 +51,7 @@ func (s *Swarm) lookupLoop(topic Topic, t *topicState) {
 	for {
 		s.mu.Lock()
 		n, _ := s.countsLocked(topic)
-		full := n >= t.opts.MaxPeers
+		full := n >= s.capOf(t)
 		s.mu.Unlock()
 		if !full {
 			if recs, err := s.node.Lookup(t.ctx, topic); err == nil {
@@ -102,7 +113,7 @@ func (s *Swarm) found(topic Topic, t *topicState, recs []kolodht.Record) {
 	order := append(known, rest...)
 	// A key kept again keeps its state; a dropped one leaves it in past.
 	for k, c := range prev {
-		delete(c.topics, topic)
+		c.dropTopic(topic)
 		if len(c.topics) == 0 && s.slots[k] == nil {
 			delete(s.cands, k)
 		}
@@ -115,7 +126,7 @@ func (s *Swarm) found(topic Topic, t *topicState, recs []kolodht.Record) {
 		k := key(r.PublicKey)
 		c := s.cands[k]
 		if c == nil {
-			if len(s.cands) >= s.cfg.MaxCandidates && !s.evictLocked(topic, quota) {
+			if len(s.cands) >= s.budgetLocked() && !s.evictLocked(topic, quota) {
 				continue
 			}
 			if c = prev[k]; c == nil {
@@ -131,6 +142,11 @@ func (s *Swarm) found(topic Topic, t *topicState, recs []kolodht.Record) {
 			c.next = time.Time{}
 		}
 		c.rec, c.addr = r, r.Addr
+		if c.recs == nil {
+			c.recs = make(map[Topic]kolodht.Record)
+		}
+		c.recs[topic] = r
+		delete(c.suspect, topic)
 		c.topics[topic] = true
 		if prev[k] == nil {
 			s.events.Push(Event{Kind: Found, Topic: topic, PublicKey: bytes.Clone(r.PublicKey), Addr: r.Addr}, classFound)
@@ -183,14 +199,15 @@ func (s *Swarm) dropCandLocked(k key) {
 	}
 }
 
-// rememberLocked keeps h in past unless it is a fresh state. Past grows to twice MaxCandidates, then keeps the
-// MaxCandidates strongest, so a trim costs O(log n) per key. Call with mu held.
+// rememberLocked keeps h in past unless it is a fresh state. Past grows to twice the candidate budget, then keeps the
+// budget's strongest, so a trim costs O(log n) per key. Call with mu held.
 func (s *Swarm) rememberLocked(k key, h history) {
 	if h.fails == 0 && h.later == 0 && !h.connected && !h.dupPending && !h.relayed && !h.next.After(time.Now()) {
 		return
 	}
 	s.past[k] = &h
-	if len(s.past) <= 2*s.cfg.MaxCandidates {
+	budget := s.budgetLocked()
+	if len(s.past) <= 2*budget {
 		return
 	}
 	type entry struct {
@@ -210,9 +227,16 @@ func (s *Swarm) rememberLocked(k key, h history) {
 		}
 		return 0
 	})
-	for _, e := range es[:len(es)-s.cfg.MaxCandidates] {
+	for _, e := range es[:len(es)-budget] {
 		delete(s.past, e.k)
 	}
+}
+
+// dropTopic removes topic from c and the record it kept for it.
+func (c *cand) dropTopic(topic Topic) {
+	delete(c.topics, topic)
+	delete(c.recs, topic)
+	delete(c.suspect, topic)
 }
 
 // weaker orders past entries, weakest first: no lasting connection; then, among lasting ones, the most failures, and
@@ -236,20 +260,23 @@ func (s *Swarm) shuffle(n int, swap func(i, j int)) {
 	rand.Shuffle(n, swap)
 }
 
-// quotaLocked is each joined topic's share of MaxCandidates. Call with mu held.
-func (s *Swarm) quotaLocked() int {
-	n := 0
-	for _, t := range s.topics {
-		if !t.left {
-			n++
-		}
+// budgetLocked is the candidates kept in all: MaxCandidates, else the most of 1024, 64 per joined topic (what 1024
+// gave each of 16 topics) and one per place. Call with mu held.
+func (s *Swarm) budgetLocked() int {
+	if s.cfg.MaxCandidates > 0 {
+		return s.cfg.MaxCandidates
 	}
-	return max(1, s.cfg.MaxCandidates/max(1, n))
+	return max(1024, 64*s.joinedCountLocked(), s.cfg.MaxPeers)
+}
+
+// quotaLocked is each joined topic's share of the candidate budget. Call with mu held.
+func (s *Swarm) quotaLocked() int {
+	return max(1, s.budgetLocked()/max(1, s.joinedCountLocked()))
 }
 
 // dropCandTopicLocked removes topic from c, and c once it has no topic and no slot. Call with mu held.
 func (s *Swarm) dropCandTopicLocked(k key, c *cand, topic Topic) {
-	delete(c.topics, topic)
+	c.dropTopic(topic)
 	if len(c.topics) == 0 && s.slots[k] == nil {
 		s.dropCandLocked(k)
 	}
@@ -313,11 +340,11 @@ func (s *Swarm) evictLocked(topic Topic, quota int) bool {
 }
 
 // foundTopicsLocked returns the joined topics of also, of k's Connect slot and dials, then those our lookups found k
-// on, at most hello.MaxTopics. Call with mu held.
+// on. Call with mu held.
 func (s *Swarm) foundTopicsLocked(k key, also ...Topic) []Topic {
 	var out []Topic
 	add := func(x Topic) {
-		if s.joinedLocked(x) && len(out) < hello.MaxTopics && !slices.Contains(out, x) {
+		if s.joinedLocked(x) && !slices.Contains(out, x) {
 			out = append(out, x)
 		}
 	}
@@ -338,4 +365,25 @@ func (s *Swarm) foundTopicsLocked(k key, also ...Topic) []Topic {
 		}
 	}
 	return out
+}
+
+// helloTopicsLocked is foundTopicsLocked cut to what a hello carries: the topics of also first, then those furthest
+// below their fair share, where this peer counts most. Call with mu held.
+func (s *Swarm) helloTopicsLocked(k key, also ...Topic) []Topic {
+	out := s.foundTopicsLocked(k, also...)
+	if len(out) <= hello.MaxTopics {
+		return out
+	}
+	ta, j := s.tallyLocked(), s.joinedCountLocked()
+	pinned := func(x Topic) bool { return slices.Contains(also, x) }
+	slices.SortStableFunc(out, func(a, b Topic) int {
+		if pa, pb := pinned(a), pinned(b); pa != pb {
+			if pa {
+				return -1
+			}
+			return 1
+		}
+		return cmp.Compare(int64(ta[a].total)*int64(s.shareOf(s.topics[b], j)), int64(ta[b].total)*int64(s.shareOf(s.topics[a], j)))
+	})
+	return out[:hello.MaxTopics]
 }

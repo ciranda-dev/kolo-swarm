@@ -2,7 +2,7 @@
 //
 // A Swarm owns a kolo-dht node. It announces and looks up the topics it joined, dials the peers it finds with
 // backoff, accepts the peers that dial it, and keeps at most one kolo-secure connection per remote key, within
-// fixed limits on peers, inbound peers, dials and handshakes. It uses relays only when Config.Relays lists some:
+// limits on peers, inbound peers, dials and handshakes that default to what the transport's memory check allows. It uses relays only when Config.Relays lists some:
 // then a peer it cannot reach directly is dialed through a kolo-relay that both peers list. Connect dials a known key
 // at a known address, and a connection the application opened another way enters through Attach.
 //

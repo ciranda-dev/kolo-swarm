@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-// ParseRelays parses a comma-separated list of at most 16 relays, each host:port@key with the key as 64 hex
+// ParseRelays parses a comma-separated list of relays, each host:port@key with the key as 64 hex
 // characters. Spaces and empty entries are ignored and duplicates dropped; one key with two addresses, one address
 // with two keys, IPv6 in any form, port 0 or anything else invalid is ErrInvalidArgument.
 func ParseRelays(s string) ([]Relay, error) {
@@ -88,8 +88,6 @@ func checkRelays(entries []Relay) ([]Relay, error) {
 	return out, nil
 }
 
-var errTooManyRelays = fmt.Errorf("more than %d relays", maxNodes)
-
 // addRelay appends r to out once, normalized. One key at two addresses, or one address with two keys, names two
 // relays as one, since one relay process has one key and one reservation table.
 func addRelay(out []Relay, r Relay) ([]Relay, error) {
@@ -110,9 +108,6 @@ func addRelay(out []Relay, r Relay) ([]Relay, error) {
 		case sameAddr:
 			return nil, errors.New("the address of an earlier relay with another key")
 		}
-	}
-	if len(out) == maxNodes {
-		return nil, errTooManyRelays
 	}
 	return append(out, Relay{Addr: addr, PublicKey: bytes.Clone(r.PublicKey)}), nil
 }

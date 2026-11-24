@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	// maxNodes bounds the names resolved at each Bootstrap, the same cap as kolo-node's -bootstrap.
-	maxNodes = 16
+	// maxResolving bounds the names resolved at once.
+	maxResolving = 16
 	// maxAddrsPerName lets one name front several entry nodes.
 	maxAddrsPerName = 8
 	// maxBootAddrs is kolo-dht's own cap on the servers one Bootstrap uses, so none is dropped there.
@@ -32,9 +32,9 @@ type resolver interface {
 	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
 }
 
-// ParseNodes parses a comma-separated list of at most 16 bootstrap nodes, each host:port with an IPv4 address or a host
+// ParseNodes parses a comma-separated list of bootstrap nodes, each host:port with an IPv4 address or a host
 // name and a port from 1 to 65535. Spaces around entries and empty entries are ignored and duplicates dropped; IPv6 in
-// any form, port 0, more entries or anything else invalid is ErrInvalidArgument.
+// any form, port 0 or anything else invalid is ErrInvalidArgument.
 func ParseNodes(s string) ([]string, error) {
 	return appendList(nil, s, func(i int) string { return fmt.Sprintf("bootstrap node %d", i) })
 }
@@ -136,9 +136,6 @@ func addNode(out []string, e string, where func() string) ([]string, error) {
 	}
 	if slices.Contains(out, n) {
 		return out, nil
-	}
-	if len(out) == maxNodes {
-		return nil, fmt.Errorf("%w: more than %d bootstrap nodes", ErrInvalidArgument, maxNodes)
 	}
 	return append(out, n), nil
 }
@@ -251,23 +248,43 @@ func reachableFrom(local netip.Addr, scope func(netip.Addr) int) func(netip.Addr
 }
 
 // resolveNodes returns the distinct IPv4 addresses of nodes, at most maxAddrsPerName per name and maxBootAddrs in all.
-// Names are resolved in parallel, each within nodeHooks.resolveTimeout, and keep only addresses reachableFrom local, so
-// a DNS answer cannot point the node at a network it was not told about. Literal addresses come first, so DNS answers
-// cannot push one out of the cap.
+// Names are resolved in list order, maxResolving at once and none started once the answers held reach maxBootAddrs,
+// each within nodeHooks.resolveTimeout, and keep only addresses reachableFrom local, so a DNS answer cannot point the
+// node at a network it was not told about. Literal addresses come first, so DNS answers cannot push one out of the cap.
 func resolveNodes(ctx context.Context, nodes []string, local netip.Addr) ([]netip.AddrPort, error) {
 	answers := make([][]netip.Addr, len(nodes))
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	held := 0
 	for i, n := range nodes {
 		host, _, _ := net.SplitHostPort(n)
 		if ip, err := netip.ParseAddr(host); err == nil {
 			answers[i] = []netip.Addr{ip}
+			held++
+		}
+	}
+	slots := make(chan struct{}, maxResolving)
+	for i, n := range nodes {
+		host, _, _ := net.SplitHostPort(n)
+		if answers[i] != nil {
 			continue
 		}
+		slots <- struct{}{}
+		mu.Lock()
+		full := held >= maxBootAddrs
+		mu.Unlock()
+		if full {
+			break
+		}
 		wg.Go(func() {
+			defer func() { <-slots }()
 			rctx, cancel := context.WithTimeout(ctx, nodeHooks.resolveTimeout)
 			defer cancel()
 			if ips, err := nodeHooks.lookupIP.LookupNetIP(rctx, "ip4", host); err == nil {
 				answers[i] = ips
+				mu.Lock()
+				held += min(len(ips), maxAddrsPerName)
+				mu.Unlock()
 			}
 		})
 	}

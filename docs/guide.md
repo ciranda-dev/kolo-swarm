@@ -18,9 +18,9 @@ A real deployment bootstraps from a few kolo-dht servers, such as kolo-node; see
 - `ParseNodes(s)` parses a comma-separated list of bootstrap nodes, each
   `host:port` with an IPv4 address or a host name, for
   `Config.BootstrapNodes`. Spaces and empty entries are ignored and
-  duplicates dropped; a bad entry, an IPv6 address in any form, port 0 or
-  more than 16 entries is `ErrInvalidArgument`, naming the entry's
-  position. `Config.BootstrapNodes` takes one entry per element: an
+  duplicates dropped; a bad entry, an IPv6 address in any form or port 0
+  is `ErrInvalidArgument`, naming the entry's position. The list has no
+  length limit. `Config.BootstrapNodes` takes one entry per element: an
   element with a comma is refused (`want host:port`), and so is one with
   spaces.
 - `LoadNodes(path)` reads the same list from a file, one `host:port` per
@@ -33,18 +33,30 @@ A real deployment bootstraps from a few kolo-dht servers, such as kolo-node; see
   `Announce` and `Lookup`; a non-nil `JoinOptions` needs at least one.
   With `Announce`, it returns once kolo-dht stored our record, and
   kolo-dht's errors (`ErrNotStored`, `ErrNoNodes`) pass through; the topic
-  is then not joined. With `Lookup`, a lookup runs at once, then every
+  is then not joined. First announcements are paced, at most 10 a second
+  after a burst of 10, so a swarm that joins many topics at once stays
+  within the 20 checked announcements a second kolo-dht allows each
+  address, and `ErrNotStored` is retried 3 times, after 1s to 8s of
+  jittered backoff, before it passes through; a `Join` can so take up to
+  about 14s longer. With `Lookup`, a lookup runs at once, then every
   `LookupInterval` plus up to a fifth of it at random, skipped while the
-  topic is at its limit. `JoinOptions.MaxPeers` caps the peers dialed or
-  admitted for the topic, and inbound peers take at most its inbound share
-  (see [protocol.md](protocol.md)). A topic already joined, or `MaxTopics` reached, is
+  topic is at its limit. There is no limit on the topics joined unless the
+  application sets `MaxTopics`. `JoinOptions.MaxPeers` caps the peers
+  dialed or admitted for the topic; left at zero the topic may use any free
+  place, and when places run out it is kept a fair share of `MaxPeers`: the
+  swarm closes a peer of a topic above its share, or an inbound peer, to
+  dial for a topic below its share or below 6 outbound peers (that peer's
+  `Lost` carries `ErrClosed`, and the peer sees code 3). Inbound peers
+  take at most the topic's inbound share (see [protocol.md](protocol.md)).
+  A topic already joined, or a `MaxTopics` the application set reached, is
   `ErrInvalidArgument`. If `Leave(topic)` runs during `Join`, `Join`
   returns `context.Canceled`. With `Announce` and `Config.Relays`, `Join`
   first waits for the first reservation attempt at each listed relay, in
   parallel, at most about 40s, except relays known down; a failed attempt
   never fails `Join`.
 - `Leave(topic)` stops announcing and looking up the topic and closes
-  (code 0) the peers that share no other topic with us. It does not block.
+  (code 0) the peers that share no other topic with us, as far as our own
+  lookups know. It does not block.
   With `Config.Relays` set, those closes run in parallel and can finish
   after `Leave` returns (a relayed close takes about 2s when the other
   side is gone), so a closed peer's `Lost` may come later.
@@ -187,7 +199,8 @@ A real deployment bootstraps from a few kolo-dht servers, such as kolo-node; see
   `ErrRefused` for `MaxPeers`, the topic's `MaxPeers` or
   `MaxConnectPeers` (also when `MaxInbound` equals `MaxPeers`, which
   leaves `Connect` no place), which only peers leaving or a new
-  configuration can end; then `ErrWait` (it wraps `ErrRefused`; retry
+  configuration can end, or when the process has no file descriptor left for
+  the dial's own UDP socket, which charges no key or address; then `ErrWait` (it wraps `ErrRefused`; retry
   later) for the key's backoff, the address's, the pair's or the host's,
   a dial to the host in progress, `MaxConnecting` dials running, or the
   dial rate. Use `errors.Is`. A key kolo-secure refuses,
@@ -263,8 +276,8 @@ a private application can use as a guard, for example
   with their UDP port open.
 
 Host names in the list are resolved to IPv4 at each `Bootstrap`, with the
-system resolver, in parallel, each name within 5s and within `ctx`'s
-deadline: at most 8 addresses per name and 64 in all, literal addresses
+system resolver, 16 names at once and none started once 64 addresses are
+held, each name within 5s and within `ctx`'s deadline: at most 8 addresses per name and 64 in all, literal addresses
 first. A name's address is kept only if it is global or in the scope of
 the swarm's own address (loopback, link-local or private), so a DNS answer
 cannot point the swarm at a local network it was not given; on an
@@ -413,7 +426,7 @@ to end through it, so the relay never sees plaintext, and the target
 proves its key as on a direct connection.
 
 Relays are a network setting, like the entry nodes: `Config.Relays` is an
-ordered list of at most 16 `Relay` values (`Addr`, `PublicKey`), empty
+ordered list of `Relay` values (`Addr`, `PublicKey`), empty
 by default, and with an empty list the swarm runs no relay code at all.
 `ParseRelays` and `LoadRelays` read the list as `host:port@key`, the key
 as 64 hex characters, with the rules of `ParseNodes` and `LoadNodes`:
@@ -425,7 +438,7 @@ relay.example.org:7448@<64 hex characters>   # resolved to IPv4 at each use
 ```
 
 `New` checks each entry: an IPv6 address in any form, port 0, a bad name,
-a key that is not 32 bytes or is our own, 17 entries, one key at two
+a key that is not 32 bytes or is our own, one key at two
 addresses or one address with two keys is `ErrInvalidConfig`, naming the
 entry's position; an exact duplicate is dropped. A name is resolved at
 each use with the rule of entry nodes, and its first usable address is
@@ -563,7 +576,10 @@ cfg := &koloswarm.Config{
 - `WindowGrowth` is off by default and then no window grows. The swarm only
   passes `DHT.Secure.Transport` on; when it derives `MaxMemory` (a zero
   value) it adds the growth `MaxGrownMemory` allows (64 MiB by default), so
-  kolo-transport's memory check still passes at any `MaxPeers`.
+  kolo-transport's memory check still passes at any `MaxPeers`. With
+  `MaxPeers` zero the check runs the other way: `MaxPeers` is the most
+  places whose windows fit in `MaxMemory` (1258 at the defaults, 1173 with
+  growth).
 
 ## Errors
 

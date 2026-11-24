@@ -9,16 +9,21 @@ is `ErrInvalidConfig`.
 
 | Option | Default | Range | Why |
 |---|---|---|---|
-| `DHT` (passed to `kolodht.New`) | nil: kolo-dht's defaults, with `MaxAnnouncements` = `MaxTopics` and the three kolo-transport rows below | see kolo-dht; `MaxAnnouncements` at least `MaxTopics` | Protocol: the node announces every joined topic |
-| `MaxPeers` (connected peers plus dials in progress) | 64 | 1 to 1024 | Memory: inbound peers count too, so one bound covers the node |
-| `MaxInbound` (peers that connected to us) | `MaxPeers`/2 rounded up: 32 | 1 to `MaxPeers` | Security: half the slots stay outbound places (lookups or `Connect`), against eclipse attacks (Heilman et al.) |
-| `MaxConnectPeers` (places `Swarm.Connect` holds: dials whose key has not proved itself yet, and the slots they became, an inbound connection that took one included) | `MaxPeers`/4, at least 1 and at most `MaxPeers` - `MaxInbound`: 16 (a derived default) | 1 to `MaxPeers` - `MaxInbound`; must be unset when `MaxInbound` equals `MaxPeers`, and `Connect` is then always refused | Security: peers that feed `Connect` choose these outbound places, so at least `MaxPeers` - `MaxInbound` - `MaxConnectPeers` places (16 at the defaults) stay with keys lookups found |
-| `JoinOptions.MaxPeers` (per topic) | `MaxPeers` | 1 to `MaxPeers` | Security: bounded by `MaxPeers`; inbound peers take at most ceil(topic `MaxPeers` × `MaxInbound` / `MaxPeers`) of a topic's places, 32 of 64 at the defaults |
-| `MaxTopics` (joined at once) | 16 | 1 to 32 | Memory: bounds lookup loops and announcements; a HELLO carries at most 32 topics |
+| `DHT` (passed to `kolodht.New`) | nil: kolo-dht's defaults, with `MaxAnnouncements` = `MaxTopics` when that is set (else 0, no cap) and the three kolo-transport rows below | see kolo-dht; `MaxAnnouncements` at least `MaxTopics`, and 0 when `MaxTopics` is 0 | Protocol: the node announces every joined topic |
+| `MaxPeers` (connected peers plus dials in progress) | 0: derived from kolo-transport's memory check, the most places whose receive windows fit `MaxMemory`: 1258 at the defaults, 1173 with `WindowGrowth` (see below) | at least 1; no maximum; a positive value is a cap of the application | Memory: inbound peers count too, so one bound covers the node. At the defaults the places are `MaxMemory` (1 GiB) / `MaxConnReceiveWindow` (512 KiB) = 2048 windows, less 2 × (`MaxHandshakes` + kolo-secure `MaxPending`) = 160 and `MaxGrownMemory` / `MaxConnReceiveWindow` with growth; with `MaxInbound` unset P + ceil(P/2) of the rest, so 1258. To raise it, raise `DHT.Secure.Transport.MaxMemory` (up to kolo-transport's 64 GiB) or set `MaxPeers` |
+| `MaxInbound` (peers that connected to us) | `MaxPeers`/2 rounded up: 629 | 1 to `MaxPeers`; with `MaxPeers` zero, the places left after it are `MaxPeers` | Security: half the slots stay outbound places (lookups or `Connect`), against eclipse attacks (Heilman et al.). An attacker needs 158 source addresses to fill 629 inbound places at kolo-transport's `MaxConnsPerIP` of 4, and kolo-dht and kolo-transport keep their own per-address and per-/24 limits |
+| `MaxConnectPeers` (places `Swarm.Connect` holds: dials whose key has not proved itself yet, and the slots they became, an inbound connection that took one included) | `MaxPeers`/4, at least 1 and at most `MaxPeers` - `MaxInbound`: 314 (a derived default) | 1 to `MaxPeers` - `MaxInbound`; must be unset when `MaxInbound` equals `MaxPeers`, and `Connect` is then always refused | Security: peers that feed `Connect` choose these outbound places, so at least `MaxPeers` - `MaxInbound` - `MaxConnectPeers` places (315 at the defaults) stay with keys lookups found. Each `Connect` place has its own UDP socket, so it also takes a file descriptor |
+| `JoinOptions.MaxPeers` (per topic) | 0: no cap of its own, the topic may use any free place and is kept a fair share when places run out | 1 to `MaxPeers` | Security: bounded by `MaxPeers`; inbound peers take at most ceil(topic limit × `MaxInbound` / `MaxPeers`) of a topic's places, half of them at the defaults |
+| fair share of a topic (fixed rule) | min(its limit, `MaxPeers` / J) for J joined topics: 25 for 50 topics at the defaults | fixed | Security: no topic is left without peers because others took every place; a dial for a topic below its share may close a peer of a topic above its share, or an inbound peer |
+| outbound minimum of a topic (fixed) | min(6, share), for a topic joined with `Lookup` | fixed | Security: 6 is kolo-gossip's mesh degree D, so a room can hold a full mesh of peers our own lookups chose, which peers that connect to us cannot take |
+| eviction when no place is free (fixed) | at most one peer closed per dial started, at most `MaxConnecting` a pass; not a peer in a hello or a place `Connect` still holds, and none whose other topics would fall below their share (or outbound minimum); inbound peers first, then `Connect` places, then outbound peers, the newest first | fixed | Security: only our own dials for our own topics start it, each raises its topic's count until its share or minimum is met, and an inbound connection never closes a peer; the closed key's backoff is not charged |
+| `MaxTopics` (joined at once) | 0: no cap | at least 1; a positive value is a cap of the application | Memory: each joined topic costs a lookup loop, an announcement and a share of the candidates; no cap of our own is set, since the places and `MaxCandidates` bound what topics hold |
+| first announcements (fixed) | a burst of 10, then 10 a second, swarm-wide | fixed | Protocol: kolo-dht checks 20 first `ANNOUNCE` messages a second per address; 10 a second sends at most 20 in any 1s window and leaves half the budget to other devices behind the address. Measured on loopback: 64 joins back to back took 5.4s |
+| `ErrNotStored` retries in `Join` (fixed) | 3, after 1s to 8s of jittered backoff | fixed | Protocol: the check budget refills each second, so 1s is the floor; 4 attempts keep the wait under 14s, since `ErrNotStored` also comes from refusals a wait does not cure |
 | `MaxConnecting` (kolo-dht `Connect` calls at once, and separately relay dials and `Swarm.Connect` dials; also `Swarm.Connect` dial starts per `RetryMin`) | 3 | 1 to 16 | Memory: bounds kolo-dht dials, relay dials and direct dials in progress; a failed `Connect` that finds no relay dial free counts as try later; `Swarm.Connect` dials have their own count, so addresses learned from peers never take the dials of keys found by lookups |
 | `MaxHandshakes` (hellos in progress; a quarter kept for `Attach`, another for known keys) | 16 | 1 to 256 | Security: a hello holds its slot for at most 2s (4s on the side that is not the arbiter), so 16 admit at least 4 a second even from silent peers |
 | `MaxHandshakesPerIP` (hellos in progress from one source, see [protocol.md](protocol.md)) | 4, or `MaxHandshakes` if lower | 1 to `MaxHandshakes` | Security: equal to kolo-transport's `MaxConnsPerIP`, so one address cannot hold every hello |
-| `MaxCandidates` (keys from lookups over all topics, split equally between joined topics; also bounds the dropped keys whose backoff state is kept, `Swarm.Connect` keys among them, at most twice it, and each of `Swarm.Connect`'s address, pair and host tables, which grow to twice it and are trimmed to it) | 1024 | 16 to 32768 | Memory: bounds what lookups can make us hold; 1024 gives each of `MaxTopics` (16) joined topics a share of 64, one topic's `MaxPeers` |
+| `MaxCandidates` (keys from lookups over all topics, split equally between joined topics; also bounds the dropped keys whose backoff state is kept, `Swarm.Connect` keys among them, at most twice it, and each of `Swarm.Connect`'s address, pair and host tables, which grow to twice it and are trimmed to it) | 0: the larger of 1024, 64 per joined topic and `MaxPeers` (1258 for 1 to 19 topics, 3200 for 50) | at least 16; no maximum | Memory: bounds what lookups can make us hold; 64 per topic is the share 1024 gave each of 16 topics, and `MaxPeers` lets a lone topic hold a candidate for every place |
 | `MaxEvents` (queued `Found`, and separately queued `Unreachable`) | 64 | 16 to 4096 | Memory: these events are hints dropped when full, and `Connected` and `Lost` are never dropped |
 | `HelloTimeout` | 10s | 1s to 60s | Security: bounds how long a whole hello can take |
 | `LookupInterval` | 10m, plus up to a fifth of it at random | 1s to 1h | Protocol: the lookup at `Join` finds the peers already there, so the interval only delays finding peers that join later |
@@ -28,18 +33,18 @@ is `ErrInvalidConfig`.
 | lasting connection (resets the failure count) | 15s | fixed | Security: a connection that ends sooner counts as a failure |
 | hello window (each step of the hello, see `Attach`) | 2s, or `HelloTimeout` if shorter | fixed | Security: bounds how long a silent peer holds a hello |
 | hellos at once per key | 2 | fixed | Security: a simultaneous open needs 2; more would let one key fill the hellos |
-| HELLO and REPLY size | 1026 and 1044 bytes, at most 32 topics | fixed | Protocol: the wire format's bound, checked before decoding |
-| kolo-transport `MaxDialed`, when zero | `MaxPeers` + `MaxHandshakes` + kolo-secure `MaxPending`, at least 32: 144 | kolo-transport's | Protocol: covers our dials and the connections kolo-dht dials to answer a punch, which become inbound peers, hellos or queued connections |
-| kolo-transport `MaxConns`, when zero | `MaxInbound` + `MaxHandshakes` + kolo-secure `MaxPending`, at least 100: 112 | kolo-transport's | Protocol: covers inbound peers, hellos and kolo-secure handshakes |
+| HELLO and REPLY size | 1026 and 1044 bytes, at most 32 topics | fixed | Protocol: the wire format's bound, checked before decoding. A peer is counted locally on every topic shared that we know, more than 32 included; a hello lists the topics furthest below their share first, and a reply the ones the hello listed first |
+| kolo-transport `MaxDialed`, when zero | `MaxPeers` + `MaxHandshakes` + kolo-secure `MaxPending`, at least 32: 1338 | kolo-transport's | Protocol: covers our dials and the connections kolo-dht dials to answer a punch, which become inbound peers, hellos or queued connections |
+| kolo-transport `MaxConns`, when zero | `MaxInbound` + `MaxHandshakes` + kolo-secure `MaxPending`, at least 100: 709 | kolo-transport's | Protocol: covers inbound peers, hellos and kolo-secure handshakes |
 | kolo-transport `MaxMemory`, when zero | (`MaxConns` + `MaxDialed`) × `MaxConnReceiveWindow`, plus `MaxGrownMemory` (64 MiB by default) when `WindowGrowth` is on, at least 1 GiB | kolo-transport's | Protocol: keeps kolo-transport's window check passing at any `MaxPeers`, with or without growth |
 | `Allow func(key, addr) bool` | nil (allow all) | false or a panic refuses | Security: a ban list or filter; `addr` is IPv4 or zero |
-| `BootstrapNodes` | empty | at most 16 entries | Security: each name is a DNS query at every `Bootstrap`, and 16 entry nodes are more than a network needs to stay reachable; equal to kolo-node's `maxEntries`, so one list works in both |
+| `BootstrapNodes` | empty | any number of entries | Protocol: a local setting, not peer input; the cost of a long list is bounded by the name resolution rows below |
 | addresses per bootstrap name (fixed) | 8 | fixed | Protocol: a name may front several entry nodes; kolo-node's `maxPerEntry` |
 | bootstrap addresses in all (fixed) | 64 | fixed | Protocol: kolo-dht's `maxBoot`, the most servers its `Bootstrap` pings, so none is dropped there |
-| name resolution (fixed) | 5s per name, in parallel, within `ctx` | fixed | Security: a slow or silent resolver cannot hold `Bootstrap`; kolo-node's resolve timeout |
+| name resolution (fixed) | 5s per name, 16 names at once in list order, none started once 64 addresses are held, within `ctx` | fixed | Security: a slow or silent resolver cannot hold `Bootstrap`, and a long list is not a burst of DNS queries; kolo-node's resolve timeout |
 | name answers kept (fixed) | global, or in the scope of the swarm's address | fixed | Security: kolo-dht's rule for addresses learned from others, so DNS cannot point the swarm at a local network |
-| `LoadNodes` file size (fixed) | 64 KiB | fixed | Security: bounds what a wrong path can make it read; 16 entries of the longest form (a 253-byte name, a colon and a 5-digit port) take about 4 KiB, the rest leaves room for comments |
-| `Relays` | empty: no relay | at most 16 entries | Security: each listed relay costs a reservation while an announced topic is joined; the same cap as `BootstrapNodes` |
+| `LoadNodes` file size (fixed) | 64 KiB | fixed | Security: bounds what a wrong path can make it read; entries of the longest form (a 253-byte name, a colon and a 5-digit port) take about 260 bytes, so about 250 fit |
+| `Relays` | empty: no relay | any number of entries | Memory: each listed relay costs a reservation connection, a goroutine and a `RelayChanged` slot while an announced topic is joined, so list the relays the network needs |
 | per listed relay, while an announced topic is joined (fixed) | one reservation connection (two for up to the relay's `MaxSessionDuration` after a lifetime end), kolo-relay's 5s keep-alive, one renewal per `ReservationLifetime`, one goroutine | fixed | Protocol: a dialer cannot learn where the target reserved, so the target reserves at every relay it lists |
 | relayed connection settings (fixed) | `DHT.Secure` and its `Transport`, for every relay | fixed | Protocol: a relayed connection has the stream limits and windows of a direct one |
 | relay connection settings (fixed) | the connection to each relay has the swarm's `DHT.Secure.Transport` `CongestionControl`, `MaxStreamReceiveWindow`, `MaxConnReceiveWindow` and `Datagrams`, a 5s keep-alive; no window growth | fixed | Protocol: the relay carries the session's packets as QUIC datagrams when the swarm's transport sets `Datagrams` and the relay offers them too, else as frames on one stream of that connection, so its controller and windows set the relayed speed; kolo-relay never allows growth on it. Memory: with `Datagrams`, datagrams add about 240 KiB of heap per relay connection (kolo-transport limits, datagram queues) and about 192 KiB per relayed session (kolo-relay limits) |
@@ -58,13 +63,17 @@ is `ErrInvalidConfig`.
 | `RelayChanged` queued (fixed) | the newest per relay | fixed | Memory: only each relay's current state matters |
 | `LoadRelays` file size (fixed) | 64 KiB | fixed | Security: the `LoadNodes` bound |
 
-Memory: the swarm holds at most `MaxCandidates` candidates plus the
+Memory: the swarm holds at most the candidate budget (`MaxCandidates`, else
+see above) of candidates plus the
 backoff state of up to twice as many dropped keys, `MaxPeers` peers,
 `MaxHandshakes` hellos, and 2 × `MaxPeers` + 2 × `MaxEvents` events, plus one
 `RelayChanged` per listed relay. Connection memory is
 kolo-transport's: up to `MaxConns` + `MaxDialed` connections (256 at the
-defaults), each with the worst case per connection given in
-kolo-transport's limits page. With `Config.Relays` set, connections outside
+defaults: 1338 + 709 = 2047), each with the worst case per connection given in
+kolo-transport's limits page. An idle connection end costs about 37 KiB of
+heap and 3 goroutines on loopback, so the 1258 default places are about
+45 MiB and 3,800 goroutines; a place that moves data costs what its windows
+allow, which is what `MaxMemory` bounds. With `Config.Relays` set, connections outside
 those limits add to it: each listed relay's reservation connection (two for
 a while after a lifetime end) while an announced topic is joined, and per
 relayed peer an end-to-end kolo-transport connection with `DHT.Secure`'s
@@ -79,3 +88,13 @@ which `MaxConnectPeers` bounds those in places `Connect` made (a direct
 was already counted, so it adds no place). Size those options to the memory the process may
 use, and set `GOMEMLIMIT` a little below it.
 
+File descriptors: the swarm's node uses one UDP socket for every direct
+peer, inbound or dialed by lookups. Only a `Swarm.Connect` place and a
+relayed peer we dialed have a socket of their own, so a swarm needs about 1
++ `MaxConnectPeers` (314 at the defaults) + the relayed peers it dialed
+descriptors, not one per place. Go raises the soft `RLIMIT_NOFILE` to the
+hard limit when a program starts. When a dial finds none left, `Connect`
+returns `ErrRefused` (limit reached) without charging a key, an address or
+a host, and a relay dial counts as a failure of its key with the usual
+backoff; the swarm is never stopped or put in a loop by it. To raise the
+limit, raise the process's descriptor limit.

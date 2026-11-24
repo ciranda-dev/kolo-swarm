@@ -25,6 +25,7 @@ type testHooks struct {
 	grow          func(Conn)                            // runs before the swarm marks a connection for window growth
 	beforeCleanup func()                                // runs when a Connect call starts its cleanup
 
+	announce    func(context.Context, kolodht.Topic) error                                         // replaces node.Announce
 	connect     func(context.Context, kolodht.Record) (*kolosecure.Conn, error)                    // replaces node.Connect
 	dial        func(context.Context, netip.AddrPort, ed25519.PublicKey) (*kolosecure.Conn, error) // replaces Connect's kolosecure.Dial
 	accept      func(context.Context, *kolorelay.Reservation) (Conn, error)                        // replaces Reservation.Accept

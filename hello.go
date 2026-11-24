@@ -62,7 +62,7 @@ func (s *Swarm) handshakeFor(ctx context.Context, c Conn, k key, inbound, direct
 		s.mu.Lock()
 		shared := s.foundTopicsLocked(k, claim...)
 		for _, x := range raw {
-			if !slices.Contains(shared, Topic(x)) && len(shared) < hello.MaxTopics {
+			if !slices.Contains(shared, Topic(x)) {
 				shared = append(shared, Topic(x))
 			}
 		}
@@ -76,7 +76,7 @@ func (s *Swarm) handshakeFor(ctx context.Context, c Conn, k key, inbound, direct
 		if s.hooks.beforeReply != nil {
 			s.hooks.beforeReply()
 		}
-		if msg, err := hello.EncodeReply(p.gen.epoch, p.gen.n, rawTopics(p.topics)); err == nil {
+		if msg, err := hello.EncodeReply(p.gen.epoch, p.gen.n, rawTopics(replyTopics(p.Topics(), raw))); err == nil {
 			st.Write(msg)
 		}
 		st.Close()
@@ -84,7 +84,7 @@ func (s *Swarm) handshakeFor(ctx context.Context, c Conn, k key, inbound, direct
 	}
 
 	s.mu.Lock()
-	mine := s.foundTopicsLocked(k, claim...)
+	mine := s.helloTopicsLocked(k, claim...)
 	s.mu.Unlock()
 	msg, err := hello.Encode(rawTopics(mine))
 	if err != nil {
@@ -123,10 +123,14 @@ func (s *Swarm) handshakeFor(ctx context.Context, c Conn, k key, inbound, direct
 		st.CancelRead(codeProtocol)
 		return refuse(c, codeProtocol, ErrProtocol)
 	}
-	shared := make([]Topic, len(raw))
-	for i, x := range raw {
-		shared[i] = Topic(x)
+	s.mu.Lock()
+	shared := s.foundTopicsLocked(k, claim...)
+	for _, x := range raw {
+		if !slices.Contains(shared, Topic(x)) {
+			shared = append(shared, Topic(x))
+		}
 	}
+	s.mu.Unlock()
 	if _, code, err := s.admitFor(c, k, addr, inbound, direct, shared, true, generation{epoch, n}, res); err != nil {
 		return refuse(c, code, err)
 	}
@@ -136,6 +140,25 @@ func (s *Swarm) handshakeFor(ctx context.Context, c Conn, k key, inbound, direct
 // readMsg reads the whole stream, up to one byte over hello.MaxSize so the decoder rejects more.
 func readMsg(st *kolotransport.Stream) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(st, hello.MaxSize+1))
+}
+
+// replyTopics cuts kept to what a reply carries: the topics the hello listed first, then the others.
+func replyTopics(kept []Topic, listed [][32]byte) []Topic {
+	if len(kept) <= hello.MaxTopics {
+		return kept
+	}
+	out := make([]Topic, 0, hello.MaxTopics)
+	for _, x := range kept {
+		if slices.Contains(listed, [32]byte(x)) && len(out) < hello.MaxTopics {
+			out = append(out, x)
+		}
+	}
+	for _, x := range kept {
+		if !slices.Contains(listed, [32]byte(x)) && len(out) < hello.MaxTopics {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 func rawTopics(topics []Topic) [][32]byte {
