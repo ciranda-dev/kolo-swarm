@@ -550,3 +550,37 @@ func TestGrowthConfigKeepsExplicitAndOldDerivation(t *testing.T) {
 		t.Fatalf("MaxMemory %d without growth, want %d", tc.MaxMemory, want)
 	}
 }
+
+// With Datagrams on, the derived places and MaxMemory count kolo-transport's 240 KiB of datagram queues per connection,
+// so the derived config passes kolo-transport's own check.
+func TestDatagramsConfigDerivedLimits(t *testing.T) {
+	checkGoroutines(t)
+	for _, tt := range []struct {
+		name  string
+		peers int
+		tc    kolotransport.Config
+	}{
+		{"defaults", 0, kolotransport.Config{Datagrams: true}},
+		{"window growth", 0, kolotransport.Config{Datagrams: true, WindowGrowth: true}},
+		{"set MaxPeers", 1024, kolotransport.Config{Datagrams: true}},
+		{"set MaxPeers and growth", 1024, kolotransport.Config{Datagrams: true, WindowGrowth: true}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := tt.tc
+			c, err := (&Config{MaxPeers: tt.peers, DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: &tc}}}).withDefaults()
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := c.DHT.Secure.Transport
+			l, err := kolotransport.Listen(testCtx(t, 10*time.Second), "127.0.0.1:0", got)
+			if err != nil {
+				t.Fatalf("kolo-transport refused the derived config: %v", err)
+			}
+			l.Close()
+		})
+	}
+	c, err := (&Config{DHT: &kolodht.Config{Secure: &kolosecure.Config{Transport: &kolotransport.Config{Datagrams: true}}}}).withDefaults()
+	if tr := c.DHT.Secure.Transport; err != nil || c.MaxPeers != 822 || c.MaxInbound != 411 || tr.MaxDialed != 902 || tr.MaxConns != 491 || tr.MaxMemory != kolotransport.DefaultMaxMemory {
+		t.Fatalf("derived with Datagrams: %v, MaxPeers %d, MaxInbound %d, %+v", err, c.MaxPeers, c.MaxInbound, tr)
+	}
+}

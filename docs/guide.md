@@ -579,7 +579,8 @@ cfg := &koloswarm.Config{
   kolo-transport's memory check still passes at any `MaxPeers`. With
   `MaxPeers` zero the check runs the other way: `MaxPeers` is the most
   places whose windows fit in `MaxMemory` (1258 at the defaults, 1173 with
-  growth).
+  growth, 822 with `Datagrams`, whose queues of 240 KiB per connection the
+  check counts).
 
 ## Errors
 
