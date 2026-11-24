@@ -126,8 +126,12 @@
   one), and "tell the other side now" is kolo-relay's own Incoming, over
   the target's authenticated reservation connection.
 - Relay dial timing: on first contact a key is dialed through the relays
-  only after its direct `Connect` failed with a failure (not try later,
-  not denied), so a peer behind a random mapping, which answers try later
+  once its direct `Connect` failed with a failure (not try later, not
+  denied), or once that `Connect` ran for kolo-dht's punch window of two
+  consistent mappings (10 probes 1s apart plus twice `RequestTimeout`,
+  12s at the defaults), past which only a random mapping can still
+  connect; that `Connect` goes on and a direct connection replaces the
+  relayed one. A peer behind a random mapping, which answers try later
   while its one random punch runs, does not send every candidate to the
   relays. A key whose last admitted connection was relayed, or whose last
   `Connect` failed, is dialed directly and through its relays at once.

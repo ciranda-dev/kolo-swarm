@@ -29,6 +29,7 @@ type testHooks struct {
 	dial        func(context.Context, netip.AddrPort, ed25519.PublicKey) (*kolosecure.Conn, error) // replaces Connect's kolosecure.Dial
 	accept      func(context.Context, *kolorelay.Reservation) (Conn, error)                        // replaces Reservation.Accept
 	beforeRelay func(ctx context.Context, relay, target ed25519.PublicKey)                         // runs before each relay dial
+	relayAfter  time.Duration                                                                      // replaces the punch window when above zero
 }
 
 // nodeHooks are set only by tests, which restore them afterwards.

@@ -62,9 +62,9 @@ type Config struct {
 	BootstrapNodes []string
 	// Relays, if not empty, connect peers that cannot connect directly: at most 16, in order of preference. While a
 	// topic is joined with Announce the swarm keeps a reservation at each and admits the peers that come through
-	// them, and a key whose kolo-dht Connect failed is dialed through them in turn, the one that carried it last
-	// first, with the swarm's own DHT.Secure settings. Two peers meet through any relay both list. Empty never uses
-	// a relay.
+	// them, and a key whose kolo-dht Connect failed, or ran past the punch window of two consistent mappings (12s at
+	// the defaults), is dialed through them in turn, the one that carried it last first, with the swarm's own
+	// DHT.Secure settings. Two peers meet through any relay both list. Empty never uses a relay.
 	Relays []Relay
 }
 
