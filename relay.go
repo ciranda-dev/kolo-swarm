@@ -62,7 +62,7 @@ func newRelayState(s *Swarm, rl Relay) *relayState {
 		MaxStreamReceiveWindow: tc.MaxStreamReceiveWindow,
 		MaxConnReceiveWindow:   tc.MaxConnReceiveWindow,
 		KeepAlivePeriod:        relayKeepAlive,
-		Datagrams:              tc.Datagrams,
+		Datagrams:              s.cfg.RelayDatagrams,
 	}}
 	return &relayState{
 		addr: rl.Addr,

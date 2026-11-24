@@ -464,7 +464,7 @@ func TestRelaySizingPerAddress(t *testing.T) {
 		r := listenRelay(t, &kolorelay.ServerConfig{Secure: &kolosecure.Config{Transport: &kolotransport.Config{
 			MaxConns: 12, MaxConnsPerIP: 12, MaxDialed: 1, MaxIncomingStreams: 2,
 			MaxStreamReceiveWindow: 64 << 10, MaxConnReceiveWindow: 256 << 10,
-		}}})
+		}}, MaxReservations: 3})
 		srv := newServer(t)
 		topic := topicOf(t.Name())
 		var ss []*Swarm

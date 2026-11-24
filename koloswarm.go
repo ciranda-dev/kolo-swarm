@@ -337,7 +337,7 @@ func (s *Swarm) Join(ctx context.Context, topic Topic, opts *JoinOptions) error 
 	case !o.Announce && !o.Lookup:
 		return fmt.Errorf("%w: JoinOptions needs Announce or Lookup", ErrInvalidArgument)
 	case o.MaxPeers < 0 || o.MaxPeers > s.cfg.MaxPeers:
-		return fmt.Errorf("%w: JoinOptions.MaxPeers must be between 1 and MaxPeers", ErrInvalidArgument)
+		return fmt.Errorf("%w: JoinOptions.MaxPeers must be between 0 and MaxPeers", ErrInvalidArgument)
 	}
 	s.mu.Lock()
 	switch {
